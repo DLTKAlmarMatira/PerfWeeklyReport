@@ -28,7 +28,7 @@ name: Weekly Performance Report
 
 on:
   schedule:
-    - cron: '0 13 * * 2'
+    - cron: '0 1 * * 2'
   workflow_dispatch: {}
 
 jobs:
@@ -68,7 +68,7 @@ jobs:
           body: "This week's performance testing report is attached (weekly_meeting_report.html), along with the underlying CSV extracts. FYI. THIS IS A GITHUB ACTIONS GENERATED EMAIL."
           attachments: |
             weekly_meeting_report.html
-            csv/pbi_summary_weekly.csv
-            csv/tester_workload_weekly.csv
-            csv/exceptions_weekly.csv
-            csv/connected_pbi_task_test_results.csv
+#            csv/pbi_summary_weekly.csv
+#            csv/tester_workload_weekly.csv
+#            csv/exceptions_weekly.csv
+#            csv/connected_pbi_task_test_results.csv
