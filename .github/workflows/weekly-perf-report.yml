@@ -65,8 +65,9 @@ jobs:
           subject: "Weekly Performance Testing Report - ${{ env.REPORT_DATE }}"
           to: AlmarMatira@deltek.com
           from: "Weekly Perf Report <almarmatira@deltek.com>"
-          html_body: file://weekly_meeting_report.html
+          body: "This week's performance testing report is attached (weekly_meeting_report.html), along with the underlying CSV extracts."
           attachments: |
+            weekly_meeting_report.html
             csv/pbi_summary_weekly.csv
             csv/tester_workload_weekly.csv
             csv/exceptions_weekly.csv
