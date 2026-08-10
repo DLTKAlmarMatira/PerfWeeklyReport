@@ -63,7 +63,7 @@ jobs:
           username: almarmatira@deltek.com
           password: ${{ secrets.SMTP_PASSWORD }}
           subject: "Weekly Performance Testing Report - ${{ env.REPORT_DATE }}"
-          to: MakatiAutomationPerformance@deltek.com 
+          to: almarmatira@deltek.com; JosephEstrella@deltek.com; JanCuevas@deltek.com; LeobertBanta@deltek.com; CharlotteMorales@deltek.com
           from: "Weekly Perf Report <almarmatira@deltek.com>"
           body: "This week's performance testing report is attached (weekly_meeting_report.html), along with the underlying CSV extracts. FYI. THIS IS A GITHUB ACTIONS GENERATED EMAIL."
           attachments: |
