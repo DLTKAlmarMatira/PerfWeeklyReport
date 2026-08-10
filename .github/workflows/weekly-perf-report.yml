@@ -1,0 +1,73 @@
+name: Weekly Performance Report
+
+# Runs Run-AdoExtracts.bat (the ADO extraction + report-build pipeline) and
+# emails the resulting HTML report + CSVs.
+#
+# SCHEDULE: cron below is 13:00 UTC every Tuesday, which is 9:00 AM US
+# Eastern during EDT (summer). GitHub Actions cron is always UTC and does
+# NOT adjust for daylight saving, so this will fire at 8:00 AM Eastern once
+# clocks fall back to EST. Edit the cron expression if you're in a different
+# timezone or want a fixed UTC time instead.
+#
+# RUNNER: this MUST run on a self-hosted Windows runner that already has
+# network access to https://tfs.deltek.com - GitHub-hosted runners cannot
+# reach internal/on-prem servers. Register a self-hosted runner on a machine
+# inside Deltek's network with the label used below (or change the label).
+#
+# SECRETS required (Settings > Secrets and variables > Actions):
+#   AZURE_DEVOPS_PAT  - ADO/TFS Personal Access Token (Test Management: Read,
+#                        Work Items: Read). Picked up automatically by the
+#                        PowerShell scripts via $env:AZURE_DEVOPS_PAT.
+#   SMTP_PASSWORD     - password for almarmatira@deltek.com on smtp.deltek.com.
+#                        (The mailbox address itself isn't secret, so it's
+#                        hardcoded below - only the password is a secret.)
+#                        Port 25 is unencrypted by default; if smtp.deltek.com
+#                        is an internal relay that doesn't require auth at
+#                        all, you can delete the username/password lines
+#                        below entirely.
+
+on:
+  schedule:
+    - cron: '0 13 * * 2'
+  workflow_dispatch: {}
+
+jobs:
+  weekly-report:
+    runs-on: [self-hosted, Windows, perf-report]
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Run ADO extracts and build weekly reports
+        shell: cmd
+        env:
+          AZURE_DEVOPS_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+        run: |
+          rem The batch file ends with `pause`, which waits forever for a
+          rem keypress. Piping a blank line into it satisfies that prompt so
+          rem it exits immediately once the pipeline finishes.
+          echo. | call Run-AdoExtracts.bat
+          if errorlevel 1 exit /b 1
+
+      - name: Set report date
+        shell: pwsh
+        run: echo "REPORT_DATE=$(Get-Date -Format 'yyyy-MM-dd')" >> $env:GITHUB_ENV
+
+      - name: Email weekly report
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.deltek.com
+          server_port: 25
+          secure: false
+          username: almarmatira@deltek.com
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Weekly Performance Testing Report - ${{ env.REPORT_DATE }}"
+          to: AlmarMatira@deltek.com
+          from: "Weekly Perf Report <almarmatira@deltek.com>"
+          html_body: file://weekly_meeting_report.html
+          attachments: |
+            csv/pbi_summary_weekly.csv
+            csv/tester_workload_weekly.csv
+            csv/exceptions_weekly.csv
+            csv/connected_pbi_task_test_results.csv
