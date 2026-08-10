@@ -63,7 +63,7 @@ jobs:
           username: almarmatira@deltek.com
           password: ${{ secrets.SMTP_PASSWORD }}
           subject: "Weekly Performance Testing Report - ${{ env.REPORT_DATE }}"
-          to: AlmarMatira@deltek.com
+          to: MakatiAutomationPerformance@deltek.com; 
           from: "Weekly Perf Report <almarmatira@deltek.com>"
           body: "This week's performance testing report is attached (weekly_meeting_report.html), along with the underlying CSV extracts."
           attachments: |
