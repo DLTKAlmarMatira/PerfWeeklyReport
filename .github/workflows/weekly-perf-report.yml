@@ -3,11 +3,13 @@ name: Weekly Performance Report
 # Runs Run-AdoExtracts.bat (the ADO extraction + report-build pipeline) and
 # emails the resulting HTML report + CSVs.
 #
-# SCHEDULE: cron below is 13:00 UTC every Tuesday, which is 9:00 AM US
-# Eastern during EDT (summer). GitHub Actions cron is always UTC and does
-# NOT adjust for daylight saving, so this will fire at 8:00 AM Eastern once
-# clocks fall back to EST. Edit the cron expression if you're in a different
-# timezone or want a fixed UTC time instead.
+# SCHEDULE: cron below is 01:07 UTC every Tuesday, which is 9:07 AM
+# Philippine Time (UTC+8). The Philippines does not observe daylight saving,
+# so this stays fixed at 9:07 AM PH Time year-round - no seasonal drift to
+# worry about. Offset by 7 minutes off the top of the hour on purpose:
+# GitHub explicitly calls out the top of every hour as the highest-load time
+# for scheduled workflows, so this dodges most of that queuing delay. Edit
+# the cron expression if you're in a different timezone.
 #
 # RUNNER: this MUST run on a self-hosted Windows runner that already has
 # network access to https://tfs.deltek.com - GitHub-hosted runners cannot
@@ -28,7 +30,7 @@ name: Weekly Performance Report
 
 on:
   schedule:
-    - cron: '0 1 * * 2'
+    - cron: '7 1 * * 2'
   workflow_dispatch: {}
 
 jobs:
@@ -63,7 +65,7 @@ jobs:
           username: almarmatira@deltek.com
           password: ${{ secrets.SMTP_PASSWORD }}
           subject: "Weekly Performance Testing Report - ${{ env.REPORT_DATE }}"
-          to: almarmatira@deltek.com; JosephEstrella@deltek.com; JanCuevas@deltek.com; LeobertBanta@deltek.com; CharlotteMorales@deltek.com
+          to: almarmatira@deltek.com, JosephEstrella@deltek.com, JanCuevas@deltek.com, LeobertBanta@deltek.com, CharlotteMorales@deltek.com
           from: "Weekly Perf Report <almarmatira@deltek.com>"
           body: "This week's performance testing report is attached (weekly_meeting_report.html).\n\nFYI. THIS IS A GITHUB ACTIONS GENERATED EMAIL."
           attachments: |
