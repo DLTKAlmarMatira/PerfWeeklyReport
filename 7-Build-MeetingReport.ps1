@@ -547,16 +547,18 @@ try {
     position: sticky;
     top: 0;
     z-index: 30;
+    background: var(--grid);
     border-color: var(--axis);
-    box-shadow: 0 3px 12px rgba(0,0,0,.22);
+    box-shadow: 0 4px 20px rgba(0,0,0,.38);
   }
   /* Fills the body's top padding, so nothing is briefly visible above the bar
-     as it pins. */
+     as it pins. The pseudo-element always matches the page background, not the
+     bar background, so it stays invisible as content scrolls under it. */
   .card.filters::before {
     content: ""; position: absolute; left: -1px; right: -1px;
     top: -26px; height: 26px; background: var(--plane);
   }
-  .filters label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
+  .filter-controls > label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
   select, input[type="search"] {
     font: inherit; color: var(--ink); background: var(--surface);
     border: 1px solid var(--border); border-radius: 6px;
@@ -568,9 +570,43 @@ try {
     flex: 0 0 auto; font-size: 12px; color: var(--ink-2);
     text-align: right; line-height: 1.45; padding-bottom: 4px; white-space: nowrap;
   }
-  /* Cap the selects so one long option label can't stretch a control and push
-     the readout onto its own line. */
-  .filter-controls select { max-width: 172px; }
+  /* Multi-select checkbox dropdown widget used by the filter bar.
+     Chart-section selects (fGroup, fLoadGroup, fLoadColor) keep the base
+     select style above and are not affected by any of these rules. */
+  .multi-sel { position: relative; display: inline-block; }
+  .multi-btn {
+    font: inherit; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 28px 6px 8px; min-height: 32px; min-width: 150px; max-width: 172px;
+    cursor: pointer; text-align: left; position: relative;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* \25BE = small down-pointing triangle (ASCII-safe in a PS1 file). */
+  .multi-btn::after {
+    content: "\25BE"; position: absolute; right: 8px; top: 50%;
+    transform: translateY(-50%); font-size: 10px; color: var(--ink-2); pointer-events: none;
+  }
+  .multi-panel {
+    position: absolute; top: calc(100% + 4px); left: 0;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.18); z-index: 100;
+    min-width: 160px; max-width: 220px; padding: 6px 0;
+    max-height: 260px; overflow-y: auto;
+  }
+  .multi-panel[hidden] { display: none; }
+  .cb-item {
+    display: flex; flex-direction: row; align-items: center; gap: 8px;
+    padding: 6px 12px; cursor: pointer; font-size: 13px; color: var(--ink);
+    white-space: nowrap; text-align: left;
+  }
+  .cb-item:hover { background: var(--grid); }
+  .cb-item input[type="checkbox"] { margin: 0; cursor: pointer; accent-color: var(--blue); }
+  .cb-sep { height: 1px; background: var(--border); margin: 4px 8px; }
+  /* Date-range sub-section inside the Activity panel. */
+  .range-inputs { display: flex; flex-direction: column; gap: 6px; padding: 4px 12px 8px; }
+  .range-inputs[hidden] { display: none; }
+  .range-lbl { display: flex; flex-direction: row; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+  .range-date { font: inherit; font-size: 12px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 3px 5px; flex: 1; min-width: 0; }
 
   /* Hero + tiles. Proportional figures on big numbers - tabular-nums makes
      them look loose at display sizes. */
@@ -735,31 +771,49 @@ try {
 <div class="card filters" role="group" aria-label="Filters">
  <div class="filter-controls">
   <label>Person
-    <select id="fPerson"><option value="">All people</option></select>
+    <div class="multi-sel" id="fPerson">
+      <button class="multi-btn" type="button" aria-haspopup="true" aria-expanded="false"><span class="multi-label">All people</span></button>
+      <div class="multi-panel" hidden></div>
+    </div>
   </label>
   <label>Product
-    <select id="fProduct"><option value="">All products</option></select>
+    <div class="multi-sel" id="fProduct">
+      <button class="multi-btn" type="button" aria-haspopup="true" aria-expanded="false"><span class="multi-label">All products</span></button>
+      <div class="multi-panel" hidden></div>
+    </div>
   </label>
   <label>Task state
-    <select id="fState">
-      <option value="__active" selected>Active</option>
-      <option value="To Do">To Do</option>
-      <option value="In Progress">In Progress</option>
-      <option value="Done">Done</option>
-      <option value="">All states</option>
-    </select>
+    <div class="multi-sel" id="fState">
+      <button class="multi-btn" type="button" aria-haspopup="true" aria-expanded="false"><span class="multi-label">3 selected</span></button>
+      <div class="multi-panel" hidden>
+        <label class="cb-item"><input type="checkbox" value="To Do" checked><span>To Do</span></label>
+        <label class="cb-item"><input type="checkbox" value="In Progress" checked><span>In Progress</span></label>
+        <label class="cb-item"><input type="checkbox" value="Done" checked><span>Done</span></label>
+      </div>
+    </div>
   </label>
   <label>Task kind
-    <select id="fKind"><option value="">All kinds</option></select>
+    <div class="multi-sel" id="fKind">
+      <button class="multi-btn" type="button" aria-haspopup="true" aria-expanded="false"><span class="multi-label">All kinds</span></button>
+      <div class="multi-panel" hidden></div>
+    </div>
   </label>
   <label>Activity
-    <select id="fActivity">
-      <option value="">Any time</option>
-      <option value="w7" selected>Worked on, last 7 days</option>
-      <option value="w14">Worked on, last 14 days</option>
-      <option value="c7">Completed, last 7 days</option>
-      <option value="c30">Completed, last 30 days</option>
-    </select>
+    <div class="multi-sel" id="fActivity">
+      <button class="multi-btn" type="button" aria-haspopup="true" aria-expanded="false"><span class="multi-label">Worked on, last 7 days</span></button>
+      <div class="multi-panel" hidden>
+        <label class="cb-item"><input type="checkbox" value="w7" checked><span>Worked on, last 7 days</span></label>
+        <label class="cb-item"><input type="checkbox" value="w14"><span>Worked on, last 14 days</span></label>
+        <label class="cb-item"><input type="checkbox" value="c7"><span>Completed, last 7 days</span></label>
+        <label class="cb-item"><input type="checkbox" value="c30"><span>Completed, last 30 days</span></label>
+        <div class="cb-sep"></div>
+        <label class="cb-item"><input type="checkbox" value="range" id="cbRange"><span>Custom range</span></label>
+        <div class="range-inputs" id="actRange" hidden>
+          <label class="range-lbl">From <input type="date" id="rangeStart" class="range-date"></label>
+          <label class="range-lbl">To&#160;&#160;&#160;<input type="date" id="rangeEnd" class="range-date"></label>
+        </div>
+      </div>
+    </div>
   </label>
   <label>Search
     <input id="fText" type="search" placeholder="task, PBI, product...">
@@ -771,7 +825,7 @@ try {
 
 <div class="card">
   <h2>Activity <span class="muted" style="font-weight:400">- what moved, as of <span id="asOf"></span></span></h2>
-  <p class="sub" style="margin-bottom:14px">Counts every task state, so completed work still shows while the State filter is on Active. Person, product, kind and search filters do apply.</p>
+  <p class="sub" style="margin-bottom:14px">All filters apply, including task state.</p>
   <div class="kpis" id="activity"></div>
 </div>
 
@@ -907,15 +961,66 @@ try {
     });
     return out.sort();
   }
-  function fillSelect(sel, values) {
+  // Multi-select helpers ---------------------------------------------------
+  // Returns a Set of checked values from a .multi-panel element.
+  function setFromPanel(panelEl) {
+    var s = new Set();
+    panelEl.querySelectorAll("input[type=checkbox]:checked").forEach(function (cb) { s.add(cb.value); });
+    return s;
+  }
+  // Returns the button label text: joined values if short, "N selected" if long.
+  function labelFromSet(s, allLabel) {
+    if (!s.size) return allLabel;
+    var arr = []; s.forEach(function (v) { arr.push(v); });
+    var text = arr.join(", ");
+    return text.length > 26 ? arr.length + " selected" : text;
+  }
+  // Toggles the named panel; closes all others first.
+  function openPanel(containerId) {
+    var cont = $(containerId), panel = cont.querySelector(".multi-panel");
+    var willOpen = panel.hidden;
+    document.querySelectorAll(".multi-panel").forEach(function (p) {
+      p.hidden = true;
+      p.closest(".multi-sel").querySelector(".multi-btn").setAttribute("aria-expanded", "false");
+    });
+    if (willOpen) {
+      panel.hidden = false;
+      cont.querySelector(".multi-btn").setAttribute("aria-expanded", "true");
+    }
+  }
+  // Populates a panel with checkbox rows from a values array.
+  // defaultSet: Set of values that start checked (pass new Set() for none).
+  function fillCheckboxes(containerId, values, defaultSet) {
+    var panel = $(containerId).querySelector(".multi-panel");
     values.forEach(function (v) {
-      var o = document.createElement("option");
-      o.value = v; o.textContent = v;   // textContent: labels are untrusted data
-      sel.appendChild(o);
+      var lbl = document.createElement("label");
+      lbl.className = "cb-item";
+      var cb = document.createElement("input");
+      cb.type = "checkbox"; cb.value = v;   // textContent on span: labels are untrusted data
+      if (defaultSet && defaultSet.has(v)) cb.checked = true;
+      var sp = document.createElement("span");
+      sp.textContent = v;
+      lbl.appendChild(cb); lbl.appendChild(sp);
+      panel.appendChild(lbl);
+    });
+  }
+  // Wires a dynamically-populated panel to update state[stateKey] on change.
+  function wirePanel(id, stateKey, allLabel) {
+    var cont = $(id), panel = cont.querySelector(".multi-panel");
+    cont.querySelector(".multi-btn").addEventListener("click", function (e) {
+      e.stopPropagation(); openPanel(id);
+    });
+    panel.addEventListener("change", function () {
+      state[stateKey] = setFromPanel(panel);
+      cont.querySelector(".multi-label").textContent = labelFromSet(state[stateKey], allLabel);
+      render();
     });
   }
 
-  var state = { person: "", product: "", state: "__active", kind: "", text: "", activity: "",
+  var state = { person: new Set(), product: new Set(),
+                state: new Set(["To Do", "In Progress", "Done"]),
+                kind: new Set(), text: "", activity: new Set(["w7"]),
+                activityRange: { start: "", end: "" },
                 group: "assignee", tableView: false, sortKey: "exec", sortDir: -1,
                 loadGroup: "assignee", loadColor: "state", loadTableView: false, colFilters: {} };
 
@@ -927,24 +1032,39 @@ try {
     w7:  function (t) { return withinDays(t.changedDays, 7); },
     w14: function (t) { return withinDays(t.changedDays, 14); },
     c7:  function (t) { return withinDays(t.closedDays, 7); },
-    c30: function (t) { return withinDays(t.closedDays, 30); }
+    c30: function (t) { return withinDays(t.closedDays, 30); },
+    // ISO string comparison works for YYYY-MM-DD dates (lexicographic = chronological).
+    range: function (t) {
+      var s = state.activityRange.start, e = state.activityRange.end;
+      if (!s && !e) return false;
+      var d = t.changedOn;
+      if (!d) return false;
+      if (s && d < s) return false;
+      if (e && d > e) return false;
+      return true;
+    }
   };
+  // Short display labels for the Activity button summary.
+  var ACT_LABEL = { w7: "Last 7d", w14: "Last 14d", c7: "Closed 7d", c30: "Closed 30d", range: "Custom" };
+  function activityLabel() {
+    if (!state.activity.size) return "Any time";
+    var arr = []; state.activity.forEach(function (a) { arr.push(ACT_LABEL[a] || a); });
+    return arr.length > 2 ? arr.length + " selected" : arr.join(", ");
+  }
 
-  // opts.ignoreState lets the Activity card span every task state while still
-  // honouring person / product / kind / search. Completed work is Done by
-  // definition, so it would always read 0 under the default Active filter.
   function visible(opts) {
     opts = opts || {};
     var q = state.text.trim().toLowerCase();
     return TASKS.filter(function (t) {
-      if (state.person && t.assignee !== state.person) return false;
-      if (state.product && t.product !== state.product) return false;
-      if (!opts.ignoreState) {
-        if (state.state === "__active") { if (t.state === "Done") return false; }
-        else if (state.state && t.state !== state.state) return false;
+      if (state.person.size  && !state.person.has(t.assignee))  return false;
+      if (state.product.size && !state.product.has(t.product))  return false;
+      if (!opts.ignoreState  && state.state.size && !state.state.has(t.state)) return false;
+      if (state.kind.size    && !state.kind.has(t.kind))         return false;
+      if (state.activity.size) {
+        var actPass = false;
+        state.activity.forEach(function (a) { if (ACTIVITY[a] && ACTIVITY[a](t)) actPass = true; });
+        if (!actPass) return false;
       }
-      if (state.kind && t.kind !== state.kind) return false;
-      if (state.activity && ACTIVITY[state.activity] && !ACTIVITY[state.activity](t)) return false;
       if (q) {
         var hay = (t.title + " " + t.pbiTitle + " " + t.product + " " + t.id + " " + t.pbiId + " " + t.assignee).toLowerCase();
         if (hay.indexOf(q) === -1) return false;
@@ -1004,7 +1124,7 @@ try {
 
   // ---- activity tiles ------------------------------------------------------
   function renderActivity() {
-    var rows = visible({ ignoreState: true });
+    var rows = visible();
     var wrap = $("activity");
     wrap.textContent = "";
 
@@ -1806,33 +1926,95 @@ try {
   }
 
   // ---- wire up -------------------------------------------------------------
-  fillSelect($("fPerson"),  uniq("assignee"));
-  fillSelect($("fProduct"), uniq("product"));
-  fillSelect($("fKind"),    uniq("kind"));
+  // Populate dynamic panels and wire the three generic filters.
+  fillCheckboxes("fPerson",  uniq("assignee"), new Set());
+  fillCheckboxes("fProduct", uniq("product"),  new Set());
+  fillCheckboxes("fKind",    uniq("kind"),     new Set());
+  wirePanel("fPerson",  "person",  "All people");
+  wirePanel("fProduct", "product", "All products");
+  wirePanel("fKind",    "kind",    "All kinds");
+
+  // fState: static panel (To Do / In Progress / Done).
+  var fStatePanel = $("fState").querySelector(".multi-panel");
+  $("fState").querySelector(".multi-btn").addEventListener("click", function (e) {
+    e.stopPropagation(); openPanel("fState");
+  });
+  fStatePanel.addEventListener("change", function () {
+    state.state = setFromPanel(fStatePanel);
+    $("fState").querySelector(".multi-label").textContent = labelFromSet(state.state, "All states");
+    render();
+  });
+
+  // fActivity: static panel; checking a completion filter clears Task state
+  // (Done tasks are excluded by the default Active state, so completion+active
+  // would always yield nothing - same guard as before, now clears checkboxes).
+  var fActPanel = $("fActivity").querySelector(".multi-panel");
+  $("fActivity").querySelector(".multi-btn").addEventListener("click", function (e) {
+    e.stopPropagation(); openPanel("fActivity");
+  });
+  fActPanel.addEventListener("change", function (e) {
+    // Show/hide date inputs when the Custom range checkbox is toggled.
+    if (e.target.value === "range") { $("actRange").hidden = !e.target.checked; }
+    state.activity = setFromPanel(fActPanel);
+    if (state.activity.has("c7") || state.activity.has("c30")) {
+      fStatePanel.querySelectorAll("input[type=checkbox]").forEach(function (cb) { cb.checked = false; });
+      state.state = new Set();
+      $("fState").querySelector(".multi-label").textContent = "All states";
+    }
+    $("fActivity").querySelector(".multi-label").textContent = activityLabel();
+    render();
+  });
+  // Date inputs fire "change" (not "input") when the picker commits a value.
+  // They live inside .multi-sel so the stopPropagation on that container already
+  // prevents them from closing the panel.
+  $("rangeStart").addEventListener("change", function (e) {
+    state.activityRange.start = e.target.value;
+    $("fActivity").querySelector(".multi-label").textContent = activityLabel();
+    render();
+  });
+  $("rangeEnd").addEventListener("change", function (e) {
+    state.activityRange.end = e.target.value;
+    $("fActivity").querySelector(".multi-label").textContent = activityLabel();
+    render();
+  });
+
+  // Close all panels when clicking anywhere outside them.
+  // Clicks inside a panel stop propagation so checkboxes don't trigger this.
+  document.querySelectorAll(".multi-sel").forEach(function (sel) {
+    sel.addEventListener("click", function (e) { e.stopPropagation(); });
+  });
+  document.addEventListener("click", function () {
+    document.querySelectorAll(".multi-panel").forEach(function (p) {
+      p.hidden = true;
+      p.closest(".multi-sel").querySelector(".multi-btn").setAttribute("aria-expanded", "false");
+    });
+  });
+
   renderLegend();
   renderLoadLegend();
 
-  $("fPerson").addEventListener("change",  function (e) { state.person = e.target.value; render(); });
-  $("fProduct").addEventListener("change", function (e) { state.product = e.target.value; render(); });
-  $("fState").addEventListener("change",   function (e) { state.state = e.target.value; render(); });
-  $("fKind").addEventListener("change",    function (e) { state.kind = e.target.value; render(); });
-  $("fActivity").addEventListener("change", function (e) {
-    state.activity = e.target.value;
-    // "Completed" means Done, so leaving State on Active would return nothing.
-    // Switch the visible control too, rather than silently ignoring it.
-    if (state.activity === "c7" || state.activity === "c30") {
-      state.state = ""; $("fState").value = "";
-    }
-    render();
-  });
   $("fGroup").addEventListener("change",   function (e) { state.group = e.target.value; render(); });
   $("fText").addEventListener("input",     function (e) { state.text = e.target.value; render(); });
   $("fReset").addEventListener("click", function () {
-    state.person = state.product = state.kind = state.text = state.activity = "";
-    state.state = "__active"; state.group = "assignee";
-    $("fPerson").value = ""; $("fProduct").value = ""; $("fKind").value = "";
-    $("fText").value = ""; $("fState").value = "__active"; $("fGroup").value = "assignee";
-    $("fActivity").value = "";
+    ["fPerson","fProduct","fKind"].forEach(function (id) {
+      $(id).querySelectorAll("input[type=checkbox]").forEach(function (cb) { cb.checked = false; });
+    });
+    $("fState").querySelectorAll("input[type=checkbox]").forEach(function (cb) {
+      cb.checked = (cb.value === "To Do" || cb.value === "In Progress");
+    });
+    $("fActivity").querySelectorAll("input[type=checkbox]").forEach(function (cb) { cb.checked = cb.value === "w7"; });
+    $("actRange").hidden = true;
+    $("rangeStart").value = ""; $("rangeEnd").value = "";
+    state.person = new Set(); state.product = new Set();
+    state.state = new Set(["To Do", "In Progress", "Done"]);
+    state.kind = new Set(); state.activity = new Set(["w7"]);
+    state.activityRange = { start: "", end: "" }; state.text = "";
+    $("fText").value = ""; $("fGroup").value = "assignee"; state.group = "assignee";
+    $("fPerson").querySelector(".multi-label").textContent   = "All people";
+    $("fProduct").querySelector(".multi-label").textContent  = "All products";
+    $("fState").querySelector(".multi-label").textContent    = "3 selected";
+    $("fKind").querySelector(".multi-label").textContent     = "All kinds";
+    $("fActivity").querySelector(".multi-label").textContent = "Last 7d";
     render();
   });
   $("tableBtn").addEventListener("click", function () { state.tableView = !state.tableView; render(); });
