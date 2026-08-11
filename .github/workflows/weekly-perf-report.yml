@@ -30,7 +30,7 @@ name: Weekly Performance Report
 
 on:
   schedule:
-    - cron: '7 1 * * 2'
+    - cron: '7 1 * * *'
   workflow_dispatch: {}
 
 jobs:
