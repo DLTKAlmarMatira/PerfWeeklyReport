@@ -512,7 +512,8 @@ try {
   .sub { color: var(--ink-2); font-size: 12.5px; margin: 0; }
   .muted { color: var(--ink-muted); }
 
-  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 18px; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 30px; }
+  header > div { flex: 1; min-width: 0; }
   button {
     font: inherit; color: var(--ink); background: var(--surface);
     border: 1px solid var(--border); border-radius: 6px;
@@ -734,6 +735,9 @@ try {
   .pill { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--ink-2); white-space: nowrap; }
   .empty { padding: 28px 8px; text-align: center; color: var(--ink-muted); }
   .hidden { display: none !important; }
+  /* Card-level collapse: a header row with an h2 and a Show/Hide toggle. */
+  .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+  .collapse-btn { flex-shrink: 0; font-size: 12px; padding: 4px 10px; min-height: 28px; }
 
   /* Tooltip enhances; every value is also in a table, never gated behind hover. */
   #tip {
@@ -829,37 +833,9 @@ try {
   <div class="kpis" id="activity"></div>
 </div>
 
-<div class="card">
-  <h2>Execution results <span class="muted" style="font-weight:400">- test points that came from a test plan</span></h2>
-  <p class="sub" style="margin-bottom:14px">Scripting tasks are excluded here: they link test cases directly, which would double-count the same results.</p>
-  <div class="kpis" id="kpis"></div>
-</div>
-
 <div id="mistakeBanner" class="banner hidden" style="margin-bottom:16px">
   <strong id="mistakeCount"></strong>
   <span>link(s) in scope use a <code>Child</code> relationship where <code>Tests</code> is required, so they are missing from ADO traceability. See <code>exceptions_weekly.csv</code>.</span>
-</div>
-
-<div class="card">
-  <div class="chart-head">
-    <div>
-      <h2 id="chartTitle">Test Points</h2>
-      <p class="sub">Bar length is volume; segments are the outcome mix.</p>
-    </div>
-    <div style="display:flex;gap:8px;align-items:center">
-      <label style="font-size:12px;color:var(--ink-2)">Group by
-        <select id="fGroup" style="min-width:120px">
-          <option value="assignee" selected>Person</option>
-          <option value="product">Product</option>
-          <option value="state">Task state</option>
-        </select>
-      </label>
-      <button id="tableBtn" type="button" aria-pressed="false">Table view</button>
-    </div>
-  </div>
-  <ul class="legend" id="legend"></ul>
-  <div id="chartWrap"><div class="bars" id="bars"></div><div class="scale" id="scale"></div></div>
-  <div id="chartTable" class="hidden"></div>
 </div>
 
 <div class="card">
@@ -894,6 +870,42 @@ try {
   <p class="sub" style="margin-bottom:12px">Outcome columns cover test-plan-sourced points, so they total to the tiles above.
      Scripting tasks show <span class="muted">-</span> because they author test cases rather than execute a plan.</p>
   <div id="taskTable"></div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <h2>Execution results <span class="muted" style="font-weight:400">- test points that came from a test plan</span></h2>
+    <button id="kpisToggle" class="collapse-btn" type="button" aria-expanded="false">Show</button>
+  </div>
+  <div id="kpisBody" hidden>
+    <p class="sub" style="margin-bottom:14px">Scripting tasks are excluded here: they link test cases directly, which would double-count the same results.</p>
+    <div class="kpis" id="kpis"></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="chart-head">
+    <div>
+      <h2 id="chartTitle">Test Points</h2>
+      <p class="sub">Bar length is volume; segments are the outcome mix.</p>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <label style="font-size:12px;color:var(--ink-2)">Group by
+        <select id="fGroup" style="min-width:120px">
+          <option value="assignee" selected>Person</option>
+          <option value="product">Product</option>
+          <option value="state">Task state</option>
+        </select>
+      </label>
+      <button id="tableBtn" type="button" aria-pressed="false">Table view</button>
+      <button id="chartToggle" class="collapse-btn" type="button" aria-expanded="false">Show</button>
+    </div>
+  </div>
+  <div id="chartBody" hidden>
+    <ul class="legend" id="legend"></ul>
+    <div id="chartWrap"><div class="bars" id="bars"></div><div class="scale" id="scale"></div></div>
+    <div id="chartTable" class="hidden"></div>
+  </div>
 </div>
 
 <footer>
@@ -2017,6 +2029,19 @@ try {
     $("fActivity").querySelector(".multi-label").textContent = "Last 7d";
     render();
   });
+  function wireCollapse(btnId, bodyId) {
+    var btn = $(btnId), body = $(bodyId);
+    btn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      var open = body.hidden;
+      body.hidden = !open;
+      btn.textContent = open ? "Hide" : "Show";
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+  }
+  wireCollapse("kpisToggle", "kpisBody");
+  wireCollapse("chartToggle", "chartBody");
+
   $("tableBtn").addEventListener("click", function () { state.tableView = !state.tableView; render(); });
   $("fLoadGroup").addEventListener("change", function (e) { state.loadGroup = e.target.value; render(); });
   $("fLoadColor").addEventListener("change", function (e) {
