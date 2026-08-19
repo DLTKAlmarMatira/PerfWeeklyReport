@@ -199,6 +199,26 @@ try {
         Write-Warning "pbi_bug_links.csv not found - bug counts will be blank. Run 8-Get-PbiBugLinks.ps1."
     }
 
+    # --- Latest discussion entry per work item, from 9-Get-WorkItemComments.ps1.
+    # --- Optional: if the CSV is absent the pipeline still completes and the
+    # --- HTML report renders normally - discussion icons simply do not appear.
+    $commentsByItem = @{}
+    $commentsPath = Join-Path $CsvDir 'workitem_comments.csv'
+    if (Test-Path -LiteralPath $commentsPath) {
+        foreach ($r in (Import-Csv -LiteralPath $commentsPath)) {
+            if ($r.WorkItemId -and $r.CommentHtml) {
+                $commentsByItem[$r.WorkItemId] = [pscustomobject]@{
+                    author = [string]$r.Author
+                    date   = Get-DateOnly $r.Date
+                    html   = [string]$r.CommentHtml
+                }
+            }
+        }
+        Write-Host ("Discussion entries loaded: {0} work item(s)" -f $commentsByItem.Count)
+    } else {
+        Write-Warning "workitem_comments.csv not found - discussion icons will be absent. Run 9-Get-WorkItemComments.ps1."
+    }
+
     # --- Activity dates. These live on the work item itself, so they come from
     # --- the link extracts rather than the connected dataset (script 6 doesn't
     # --- carry them). StateChangeDate and ClosedDate are 100% / correctly
@@ -372,6 +392,19 @@ try {
             na       = $t.na
             never    = $t.never
             mistakes = $t.mistakes
+            discDays = if ($commentsByItem.ContainsKey($t.id)) { Get-DaysSince $commentsByItem[$t.id].date } else { -1 }
+            taskDisc = $(
+                $tc = $commentsByItem[$t.id]
+                if ($tc) { [pscustomobject]@{ author = $tc.author; date = $tc.date; html = $tc.html } }
+                else { $null }
+            )
+            pbiDisc = $(
+                if ($t.pbiId) {
+                    $pc = $commentsByItem[$t.pbiId]
+                    if ($pc) { [pscustomobject]@{ author = $pc.author; date = $pc.date; html = $pc.html } }
+                    else { $null }
+                } else { $null }
+            )
         }
     }
     $tasks = @($tasks)
@@ -390,6 +423,7 @@ try {
         circle  = [string][char]0x25CB   # hollow circle
         mdash   = [string][char]0x2014   # em dash
         dot     = [string][char]0x00B7   # middot separator
+        times   = [string][char]0x00D7   # multiplication sign (dismiss button)
         up      = [string][char]0x2191
         down    = [string][char]0x2193
     }
@@ -680,6 +714,23 @@ try {
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--ink); }
   tbody tr:hover { background: var(--plane); }
+  .pbi-row { cursor: pointer; }
+  .pbi-selected { background: rgba(57,135,229,0.10); box-shadow: inset 3px 0 0 var(--ts-doing); }
+  .pbi-selected:hover { background: rgba(57,135,229,0.15); }
+  .disc-btn { background: none; border: none; cursor: pointer; padding: 2px 5px; color: var(--ink-2); border-radius: 4px; line-height: 1; }
+  .disc-btn:hover { color: var(--ink); background: var(--plane); }
+  .disc-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 200; display: flex; align-items: center; justify-content: center; }
+  .disc-dialog { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px 24px; max-width: 600px; width: 90%; max-height: 80vh; overflow-y: auto; box-shadow: 0 8px 32px rgba(0,0,0,0.22); position: relative; }
+  .disc-dialog h3 { font-size: 15px; font-weight: 600; margin: 0; padding-right: 36px; line-height: 1.3; }
+  .disc-close { position: absolute; top: 14px; right: 16px; background: none; border: none; cursor: pointer; font-size: 20px; color: var(--ink-2); padding: 0 6px; border-radius: 4px; line-height: 1; }
+  .disc-close:hover { color: var(--ink); background: var(--plane); }
+  .disc-section { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .disc-who { font-size: 11px; font-weight: 600; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.05em; }
+  .disc-meta { font-size: 11.5px; color: var(--ink-muted); margin: 3px 0 8px; }
+  .disc-body { font-size: 13.5px; line-height: 1.65; }
+  .disc-body p { margin: 0 0 6px; }
+  .disc-body p:last-child { margin-bottom: 0; }
+  .disc-none { color: var(--ink-muted); font-style: italic; font-size: 13px; }
   .tasktitle { font-weight: 500; }
   td.nowrap { white-space: nowrap; }
 
@@ -917,6 +968,13 @@ try {
 <div id="tip" role="tooltip" aria-hidden="true"></div>
 
 <script id="payload" type="application/json">/*__DATA__*/</script>
+<div id="discOverlay" class="disc-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="discTitle">
+  <div class="disc-dialog">
+    <button id="discClose" class="disc-close" type="button" aria-label="Close discussion">&times;</button>
+    <h3 id="discTitle"></h3>
+    <div id="discContent"></div>
+  </div>
+</div>
 <script>
 (function () {
   "use strict";
@@ -1034,15 +1092,16 @@ try {
                 kind: new Set(), text: "", activity: new Set(["w7"]),
                 activityRange: { start: "", end: "" },
                 group: "assignee", tableView: false, sortKey: "exec", sortDir: -1,
-                loadGroup: "assignee", loadColor: "state", loadTableView: false, colFilters: {} };
+                loadGroup: "assignee", loadColor: "state", loadTableView: false,
+                selectedPbiKey: null, colFilters: {} };
 
   // changedDays / closedDays are -1 when the date is absent, so a plain
   // "<= 7" test would wrongly match those. Always require >= 0 first.
   function withinDays(value, limit) { return value >= 0 && value <= limit; }
 
   var ACTIVITY = {
-    w7:  function (t) { return withinDays(t.changedDays, 7); },
-    w14: function (t) { return withinDays(t.changedDays, 14); },
+    w7:  function (t) { return withinDays(t.changedDays, 7)  || withinDays(t.discDays, 7); },
+    w14: function (t) { return withinDays(t.changedDays, 14) || withinDays(t.discDays, 14); },
     c7:  function (t) { return withinDays(t.closedDays, 7); },
     c30: function (t) { return withinDays(t.closedDays, 30); },
     // ISO string comparison works for YYYY-MM-DD dates (lexicographic = chronological).
@@ -1528,7 +1587,6 @@ try {
       bars.appendChild(row);
     });
 
-    [0, Math.round(max / 2), max].forEach(function (v) { scale.appendChild(el("span", null, fmt(v))); });
     return groups;
   }
 
@@ -1585,12 +1643,11 @@ try {
     host.textContent = "";
     var t = el("table"), thead = el("thead"), hr = el("tr");
     // Target (index 2) is centred to match the meter cells meterCell() emits.
-    [state.loadGroup === "assignee" ? "Person" : "Product", "PBI", "Target", "Tasks", "Bugs"].forEach(function (h, i) {
-      hr.appendChild(el("th", i === 2 ? "ctr" : (i >= 3 ? "num" : null), h));
+    [state.loadGroup === "assignee" ? "Person" : "Product", "PBI", "Target"].forEach(function (h, i) {
+      hr.appendChild(el("th", i === 2 ? "ctr" : null, h));
     });
-    // Each count column carries the legend's own swatch, so the table view is
-    // readable as the SAME encoding as the bars above it. Without this the
-    // legend floats over a table with no colour in it and means nothing.
+    // State-breakdown columns (To Do / In Progress / Done) carry the legend
+    // swatch so the table shares the same colour encoding as the bars above.
     loadDims().forEach(function (d) {
       var th = el("th", "num");
       var sw = el("span", "hsw");
@@ -1600,6 +1657,7 @@ try {
       th.appendChild(document.createTextNode(d.label));
       hr.appendChild(th);
     });
+    hr.appendChild(el("th", "num", "Bugs"));
     thead.appendChild(hr); t.appendChild(thead);
 
     var tb = el("tbody");
@@ -1618,17 +1676,30 @@ try {
       // means "no target set" on the PBI rows below. The soonest live deadline
       // is still available - it is in the bar's tooltip, labelled as such.
       sr.appendChild(el("td", "ctr"));
-      var totCell = el("td", "num", fmt(g.total)); totCell.style.fontWeight = "600";
-      sr.appendChild(totCell);
+      loadDims().forEach(function (d) { sr.appendChild(el("td", "num", fmt(g[d.field]))); });
       var gBugs = Object.keys(g.bugSet).length;
       var gb = el("td", "num" + (gBugs ? "" : " muted"), fmt(gBugs));
       if (gBugs) gb.style.fontWeight = "600";
       sr.appendChild(gb);
-      loadDims().forEach(function (d) { sr.appendChild(el("td", "num", fmt(g[d.field]))); });
       tb.appendChild(sr);
 
       pbis.forEach(function (p) {
-        var tr = el("tr");
+        var pbiKey = p.id || "(no PBI parent)";
+        var isSelected = state.selectedPbiKey === pbiKey;
+        var tr = el("tr", "pbi-row" + (isSelected ? " pbi-selected" : ""));
+        tr.tabIndex = 0;
+        tr.title = isSelected ? "Click to deselect (show all tasks)" : "Click to filter tasks to this PBI";
+        tr.setAttribute("aria-selected", isSelected ? "true" : "false");
+        (function (key) {
+          function toggle() {
+            state.selectedPbiKey = state.selectedPbiKey === key ? null : key;
+            render();
+          }
+          tr.addEventListener("click", toggle);
+          tr.addEventListener("keydown", function (e) {
+            if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
+          });
+        })(pbiKey);
         tr.appendChild(el("td", null, ""));
         var c = el("td");
         c.appendChild(el("div", null, p.title));
@@ -1637,13 +1708,12 @@ try {
         // Target belongs on the PBI row - that is the level the date is set at.
         // A PBI counts as done only when every one of its tasks is.
         tr.appendChild(meterCell(p, p["Done"] === p.tasks));
-        tr.appendChild(el("td", "num", fmt(p.tasks)));
-        tr.appendChild(el("td", "num" + (p.bugs ? "" : " muted"), fmt(p.bugs)));
         // Real per-PBI counts. A zero is dimmed rather than dashed - a dash
         // reads as "no data", but 0 here is a genuine, known count.
         loadDims().forEach(function (d) {
           tr.appendChild(el("td", "num" + (p[d.field] ? "" : " muted"), fmt(p[d.field])));
         });
+        tr.appendChild(el("td", "num" + (p.bugs ? "" : " muted"), fmt(p.bugs)));
         tb.appendChild(tr);
       });
     });
@@ -1666,6 +1736,7 @@ try {
     // num:true keeps it sortable and filterable with >/< expressions;
     // align:"center" only changes where it sits in the column.
     { key: "daysLeft",    label: "Target",      num: true, align: "center" },
+    { key: "disc",        label: "",             num: false, noSort: true, noFilter: true, align: "center" },
     { key: "cases",    label: "Cases",     num: true },
     { key: "exec",     label: "Points",    num: true },
     { key: "passed",   label: "Passed",    num: true },
@@ -1715,8 +1786,8 @@ try {
         if (!numMatch(colValue(task, c.key), f)) return false;
       } else {
         var v = String(task[c.key] === undefined || task[c.key] === null ? "" : task[c.key]);
-        // The Task cell also renders the ID and PBI, so search those too -
-        // otherwise typing a PBI number you can see would find nothing.
+        // Also search by task ID and PBI so filters on those work even though
+        // neither is visible as its own column.
         if (c.key === "title") v += " " + task.id + " " + (task.pbiId || "") + " " + (task.pbiTitle || "");
         if (v.toLowerCase().indexOf(f.toLowerCase()) === -1) return false;
       }
@@ -1730,18 +1801,20 @@ try {
     var t = el("table"), thead = el("thead"), hr = el("tr"), labels = {};
 
     COLS.forEach(function (c) {
-      var th = el("th", (c.align === "center" ? "ctr " : (c.num ? "num " : "")) + "sortable");
+      var th = el("th", (c.align === "center" ? "ctr " : (c.num ? "num " : "")) + (c.noSort ? "" : "sortable"));
       var span = el("span", null, c.label);
       labels[c.key] = span;
       th.appendChild(span);
-      th.tabIndex = 0;
-      function doSort() {
-        if (state.sortKey === c.key) state.sortDir = -state.sortDir;
-        else { state.sortKey = c.key; state.sortDir = c.num ? -1 : 1; }
-        renderTasks(lastRows);
+      if (!c.noSort) {
+        th.tabIndex = 0;
+        function doSort() {
+          if (state.sortKey === c.key) state.sortDir = -state.sortDir;
+          else { state.sortKey = c.key; state.sortDir = c.num ? -1 : 1; }
+          renderTasks(lastRows);
+        }
+        th.addEventListener("click", doSort);
+        th.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); doSort(); } });
       }
-      th.addEventListener("click", doSort);
-      th.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); doSort(); } });
       hr.appendChild(th);
     });
     thead.appendChild(hr);
@@ -1749,6 +1822,7 @@ try {
     var fr = el("tr", "filterrow");
     COLS.forEach(function (c) {
       var cell = el("th", c.align === "center" ? "ctr" : (c.num ? "num" : null)), input;
+      if (c.noFilter) { fr.appendChild(cell); return; }
       if (c.options) {
         input = document.createElement("select");
         var blank = document.createElement("option");
@@ -1805,16 +1879,40 @@ try {
         (state.sortKey === c.key ? (state.sortDir === 1 ? " " + GL.up : " " + GL.down) : "");
     });
 
-    var filtered = rows.filter(passesColFilters);
+    // When in table view with a PBI selected, scope to that PBI's tasks first.
+    var baseRows = (state.loadTableView && state.selectedPbiKey)
+      ? rows.filter(function (t) { return (t.pbiId || "(no PBI parent)") === state.selectedPbiKey; })
+      : rows;
+
+    var filtered = baseRows.filter(passesColFilters);
     var sorted = filtered.slice().sort(function (a, b) {
       var x = a[state.sortKey], y = b[state.sortKey];
       if (typeof x === "number" && typeof y === "number") return (x - y) * state.sortDir;
       return String(x).localeCompare(String(y)) * state.sortDir;
     });
 
-    taskUI.note.textContent = filtered.length === rows.length
-      ? fmt(rows.length) + " task" + (rows.length === 1 ? "" : "s")
-      : "Showing " + fmt(filtered.length) + " of " + fmt(rows.length) + " tasks (column filters active)";
+    taskUI.note.textContent = "";
+    if (state.loadTableView && state.selectedPbiKey) {
+      var pbiTitle = state.selectedPbiKey === "(no PBI parent)" ? "(no PBI parent)" : "";
+      for (var ni = 0; ni < baseRows.length; ni++) {
+        if (baseRows[ni].pbiTitle) { pbiTitle = baseRows[ni].pbiTitle; break; }
+      }
+      var countStr = filtered.length === baseRows.length
+        ? fmt(baseRows.length) + " task" + (baseRows.length === 1 ? "" : "s")
+        : "Showing " + fmt(filtered.length) + " of " + fmt(baseRows.length) + " tasks";
+      taskUI.note.appendChild(document.createTextNode(countStr));
+      var clrBtn = document.createElement("button");
+      clrBtn.type = "button";
+      clrBtn.title = "Show all tasks";
+      clrBtn.style.cssText = "font: inherit; margin-left: 6px; padding: 0 5px; line-height: 1.4; vertical-align: middle; cursor: pointer;";
+      clrBtn.textContent = GL.times;
+      clrBtn.addEventListener("click", function () { state.selectedPbiKey = null; render(); });
+      taskUI.note.appendChild(clrBtn);
+    } else {
+      taskUI.note.textContent = filtered.length === rows.length
+        ? fmt(rows.length) + " task" + (rows.length === 1 ? "" : "s")
+        : "Showing " + fmt(filtered.length) + " of " + fmt(rows.length) + " tasks (column filters active)";
+    }
 
     var tb = taskUI.tbody;
     tb.textContent = "";
@@ -1831,8 +1929,6 @@ try {
       var td = el("td");
       td.appendChild(el("div", "tasktitle", task.title));
       var meta = "#" + task.id;
-      if (task.pbiId) meta += SEP + "PBI " + task.pbiId;
-      else meta += SEP + "no PBI parent";
       // Start rides the meta line rather than taking a 15th column: it is
       // auto-derived (PBI created date) and lower-value than the target, but
       // it is what makes the target a window rather than a bare deadline.
@@ -1866,6 +1962,21 @@ try {
       tr.appendChild(chg);
 
       tr.appendChild(meterCell(task, task.state === "Done"));
+
+      var discTd = el("td", "ctr");
+      if (task.taskDisc || task.pbiDisc) {
+        var dBtn = document.createElement("button");
+        dBtn.className = "disc-btn";
+        dBtn.title = "View latest discussion";
+        dBtn.setAttribute("aria-label", "Latest discussion for " + task.title);
+        dBtn.innerHTML = '<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M2 1h12a1 1 0 011 1v8a1 1 0 01-1 1H9l-3 3-3-3H2a1 1 0 01-1-1V2a1 1 0 011-1z"/></svg>';
+        (function (t) { dBtn.addEventListener("click", function (e) { e.stopPropagation(); showDisc(t); }); })(task);
+        discTd.appendChild(dBtn);
+      } else {
+        discTd.className += " muted";
+        discTd.textContent = GL.mdash;
+      }
+      tr.appendChild(discTd);
 
       tr.appendChild(el("td", "num", fmt(task.cases)));
 
@@ -2049,7 +2160,11 @@ try {
     renderLoadLegend();          // the legend changes with the dimension
     render();
   });
-  $("loadTableBtn").addEventListener("click", function () { state.loadTableView = !state.loadTableView; render(); });
+  $("loadTableBtn").addEventListener("click", function () {
+    state.loadTableView = !state.loadTableView;
+    if (!state.loadTableView) state.selectedPbiKey = null;
+    render();
+  });
 
   $("themeBtn").addEventListener("click", function () {
     var cur = document.documentElement.getAttribute("data-theme");
@@ -2061,6 +2176,49 @@ try {
     var saved = localStorage.getItem("perfReportTheme");
     if (saved) document.documentElement.setAttribute("data-theme", saved);
   } catch (err) {}
+
+  // ---- discussion dialog ---------------------------------------------------
+  function showDisc(task) {
+    $("discTitle").textContent = task.title;
+    var content = $("discContent");
+    content.textContent = "";
+
+    function section(who, disc) {
+      var sec = el("div", "disc-section");
+      sec.appendChild(el("div", "disc-who", who));
+      if (disc && disc.html) {
+        var byLine = (disc.author || "") + (disc.date ? "  " + GL.dot + "  " + disc.date : "");
+        if (byLine.trim()) sec.appendChild(el("div", "disc-meta", byLine));
+        var body = el("div", "disc-body");
+        body.innerHTML = disc.html;
+        sec.appendChild(body);
+      } else {
+        sec.appendChild(el("div", "disc-none", "No discussion entries."));
+      }
+      return sec;
+    }
+
+    content.appendChild(section("Task #" + task.id, task.taskDisc));
+    if (task.pbiId) {
+      var pbiWho = "PBI" + (task.pbiTitle ? " " + GL.mdash + " " + task.pbiTitle : " " + task.pbiId);
+      content.appendChild(section(pbiWho, task.pbiDisc));
+    }
+
+    $("discOverlay").classList.remove("hidden");
+    $("discClose").focus();
+  }
+
+  function closeDisc() { $("discOverlay").classList.add("hidden"); }
+
+  $("discClose").addEventListener("click", closeDisc);
+  $("discOverlay").addEventListener("click", function (e) {
+    if (e.target === $("discOverlay")) closeDisc();
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && !$("discOverlay").classList.contains("hidden")) {
+      e.preventDefault(); closeDisc();
+    }
+  });
 
   $("genAt").textContent = META.generated || "";
   $("asOf").textContent = META.asOf || "";

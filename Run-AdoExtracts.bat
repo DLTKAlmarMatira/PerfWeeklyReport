@@ -66,40 +66,40 @@ set "PBI_EXTRA_FIELDS=%EXTRA_FIELDS%,System.CreatedDate,Deltek.PlanHotFixRelDt"
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 
 echo ========================================
-echo [1/4] Test Plan run results
+echo [1/7] Test Plan run results
 echo ========================================
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%1-Get-TestPlanResults.ps1" -OutputPath "%OUTDIR%\test_plan_results.csv"
 if errorlevel 1 (
     echo.
-    echo [1/4] FAILED. Stopping.
+    echo [1/7] FAILED. Stopping.
     goto :end
 )
 
 echo.
 echo ========================================
-echo [2/4] PBI to Task links
+echo [2/7] PBI to Task links
 echo ========================================
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%2-Get-AdoQueryResults.ps1" -QueryUrl "%PBI_QUERY_URL%" -OutputPath "%OUTDIR%\pbi_task_links.csv" -ExtraFields "%PBI_EXTRA_FIELDS%"
 if errorlevel 1 (
     echo.
-    echo [2/4] FAILED. Stopping.
+    echo [2/7] FAILED. Stopping.
     goto :end
 )
 
 echo.
 echo ========================================
-echo [3/4] Task to Test Case/Test Plan "Tests" links
+echo [3/7] Task to Test Case/Test Plan "Tests" links
 echo ========================================
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%3-Get-TaskTestsLinkResults.ps1" -OutputPath "%OUTDIR%\task_tests_link_results.csv" -ExtraFields "%EXTRA_FIELDS%"
 if errorlevel 1 (
     echo.
-    echo [3/4] FAILED. Stopping.
+    echo [3/7] FAILED. Stopping.
     goto :end
 )
 
 echo.
 echo ========================================
-echo [4/6] PBI to Bug "Related" links
+echo [4/7] PBI to Bug "Related" links
 echo ========================================
 rem Bugs hang off a PBI with a plain "Related" link, which the saved query in
 rem step 2 does NOT return - it asks only for Parent/Child. This step walks the
@@ -107,18 +107,34 @@ rem relations through the REST API instead, so no ADO query edit is needed.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%8-Get-PbiBugLinks.ps1" -CsvDir "%OUTDIR%"
 if errorlevel 1 (
     echo.
-    echo [4/6] FAILED. Stopping.
+    echo [4/7] FAILED. Stopping.
     goto :end
 )
 
 echo.
 echo ========================================
-echo [5/6] Build derived weekly reports
+echo [5/7] Latest discussion entries
+echo ========================================
+rem Fetches the most-recent discussion comment for every PBI and Task so the
+rem HTML report can show it on demand. Optional: if this step fails the rest
+rem of the pipeline still completes - discussion icons will simply not appear.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%9-Get-WorkItemComments.ps1" -CsvDir "%OUTDIR%"
+if errorlevel 1 (
+    echo.
+    echo [5/7] WARNING: discussion fetch failed - continuing without it.
+    echo       Discussion icons will not appear in the HTML report.
+    echo       Re-run manually with:
+    echo         powershell -File "%SCRIPT_DIR%9-Get-WorkItemComments.ps1"
+)
+
+echo.
+echo ========================================
+echo [6/7] Build derived weekly reports
 echo ========================================
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%6-Build-WeeklyReports.ps1" -CsvDir "%OUTDIR%"
 if errorlevel 1 (
     echo.
-    echo [5/6] FAILED. The raw extracts above are still good - you can
+    echo [6/7] FAILED. The raw extracts above are still good - you can
     echo       re-run just this step with:
     echo         powershell -File "%SCRIPT_DIR%6-Build-WeeklyReports.ps1"
     goto :end
@@ -126,12 +142,12 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo [6/6] Build HTML meeting report
+echo [7/7] Build HTML meeting report
 echo ========================================
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%7-Build-MeetingReport.ps1" -CsvDir "%OUTDIR%"
 if errorlevel 1 (
     echo.
-    echo [6/6] FAILED. The CSVs above are still good - you can
+    echo [7/7] FAILED. The CSVs above are still good - you can
     echo       re-run just this step with:
     echo         powershell -File "%SCRIPT_DIR%7-Build-MeetingReport.ps1"
     goto :end
@@ -139,7 +155,7 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo All done: extracts + bug links + weekly CSVs + HTML report.
+echo All done: extracts + bug links + discussion + weekly CSVs + HTML report.
 echo   CSVs        : %OUTDIR%
 echo   HTML report : %SCRIPT_DIR%weekly_meeting_report.html
 echo ========================================
