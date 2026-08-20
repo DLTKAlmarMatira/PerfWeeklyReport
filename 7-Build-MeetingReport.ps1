@@ -199,6 +199,26 @@ try {
         Write-Warning "pbi_bug_links.csv not found - bug counts will be blank. Run 8-Get-PbiBugLinks.ps1."
     }
 
+    # --- Bugs linked directly to Tasks (task_bug_links.csv from 8-Get-PbiBugLinks.ps1).
+    # --- These are merged with PBI-level bugs at task-object build time below.
+    $bugsByTask = @{}
+    $taskBugLinksPath = Join-Path $CsvDir 'task_bug_links.csv'
+    if (Test-Path -LiteralPath $taskBugLinksPath) {
+        $taskBugUnreadable = 0
+        foreach ($r in (Import-Csv -LiteralPath $taskBugLinksPath)) {
+            if ($r.Readable -eq 'False') { $taskBugUnreadable++; continue }
+            if ($r.'Target Type' -ne 'Bug') { continue }
+            $bugTaskId = $r.'Task ID'
+            if (-not $bugsByTask.ContainsKey($bugTaskId)) {
+                $bugsByTask[$bugTaskId] = [System.Collections.Generic.HashSet[string]]::new()
+            }
+            [void]$bugsByTask[$bugTaskId].Add($r.'Target ID')
+        }
+        Write-Host ("Task bug links: {0} Task(s) carry bugs; {1} related target(s) unreadable" -f $bugsByTask.Count, $taskBugUnreadable)
+    } else {
+        Write-Warning "task_bug_links.csv not found - task-level bug counts will be blank. Run 8-Get-PbiBugLinks.ps1."
+    }
+
     # --- Latest discussion entry per work item, from 9-Get-WorkItemComments.ps1.
     # --- Optional: if the CSV is absent the pipeline still completes and the
     # --- HTML report renders normally - discussion icons simply do not appear.
@@ -365,9 +385,16 @@ try {
             # de-duplicate at group level: one bug linked to two of a person's
             # PBIs must count once for that person, not twice.
             bugIds      = $(
+                # Merge PBI-level and task-level Related bugs, de-duplicated.
+                # A bug linked to both the PBI and the task must count once.
+                $bugSet = [System.Collections.Generic.HashSet[string]]::new()
                 if ($t.pbiId -and $bugsByPbi.ContainsKey($t.pbiId)) {
-                    (@($bugsByPbi[$t.pbiId]) | Sort-Object) -join ','
-                } else { '' }
+                    foreach ($b in $bugsByPbi[$t.pbiId]) { [void]$bugSet.Add($b) }
+                }
+                if ($bugsByTask.ContainsKey($t.id)) {
+                    foreach ($b in $bugsByTask[$t.id]) { [void]$bugSet.Add($b) }
+                }
+                if ($bugSet.Count) { (@($bugSet) | Sort-Object) -join ',' } else { '' }
             )
             daysLeft    = $(
                 $d = Get-DaysUntil $t.pbiTarget
@@ -778,7 +805,7 @@ try {
      the Task/PBI column and the meter ends up squeezed against the number
      block - centred, but visibly cramped. */
   #taskTable th:nth-child(7), #taskTable td:nth-child(7),
-  #loadTable th:nth-child(3), #loadTable td:nth-child(3) { min-width: 104px; }
+  #loadTable th:nth-child(4), #loadTable td:nth-child(4) { min-width: 104px; }
   .colfoot { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
   .colfoot .sub { margin: 0; }
   .colfoot button { margin-left: auto; }
@@ -1529,7 +1556,7 @@ try {
       }
       var pk = t.pbiId || "(no PBI parent)";
       if (!g.pbis[pk]) {
-        g.pbis[pk] = { id: t.pbiId, title: t.pbiTitle || "(no PBI parent)", tasks: 0,
+        g.pbis[pk] = { id: t.pbiId, title: t.pbiTitle || "(no PBI parent)", product: t.product || "", tasks: 0,
                        targetOn: t.targetOn, daysLeft: t.daysLeft, startOn: t.startOn,
                        windowDays: t.windowDays, closedDays: null, closedOn: "",
                        // Bugs hang off the PBI, so every task of a PBI reports
@@ -1643,8 +1670,8 @@ try {
     host.textContent = "";
     var t = el("table"), thead = el("thead"), hr = el("tr");
     // Target (index 2) is centred to match the meter cells meterCell() emits.
-    [state.loadGroup === "assignee" ? "Person" : "Product", "PBI", "Target"].forEach(function (h, i) {
-      hr.appendChild(el("th", i === 2 ? "ctr" : null, h));
+    [state.loadGroup === "assignee" ? "Person" : "Product", "PBI", "Product", "Target"].forEach(function (h, i) {
+      hr.appendChild(el("th", i === 3 ? "ctr" : null, h));
     });
     // State-breakdown columns (To Do / In Progress / Done) carry the legend
     // swatch so the table shares the same colour encoding as the bars above.
@@ -1657,7 +1684,6 @@ try {
       th.appendChild(document.createTextNode(d.label));
       hr.appendChild(th);
     });
-    hr.appendChild(el("th", "num", "Bugs"));
     thead.appendChild(hr); t.appendChild(thead);
 
     var tb = el("tbody");
@@ -1670,6 +1696,7 @@ try {
       nameCell.style.fontWeight = "600";
       sr.appendChild(nameCell);
       sr.appendChild(el("td", "muted", fmt(pbis.length) + " PBI" + (pbis.length === 1 ? "" : "s")));
+      sr.appendChild(el("td"));
       // Target stays BLANK on the group row. It is a PBI-level date, so putting
       // one PBI's deadline on a row that represents many would read as though
       // the whole group shared it. Blank rather than a dash, because a dash
@@ -1677,10 +1704,6 @@ try {
       // is still available - it is in the bar's tooltip, labelled as such.
       sr.appendChild(el("td", "ctr"));
       loadDims().forEach(function (d) { sr.appendChild(el("td", "num", fmt(g[d.field]))); });
-      var gBugs = Object.keys(g.bugSet).length;
-      var gb = el("td", "num" + (gBugs ? "" : " muted"), fmt(gBugs));
-      if (gBugs) gb.style.fontWeight = "600";
-      sr.appendChild(gb);
       tb.appendChild(sr);
 
       pbis.forEach(function (p) {
@@ -1705,6 +1728,7 @@ try {
         c.appendChild(el("div", null, p.title));
         if (p.id) c.appendChild(el("div", "meta-line", "PBI " + p.id));
         tr.appendChild(c);
+        tr.appendChild(el("td", p.product ? null : "muted", p.product || GL.mdash));
         // Target belongs on the PBI row - that is the level the date is set at.
         // A PBI counts as done only when every one of its tasks is.
         tr.appendChild(meterCell(p, p["Done"] === p.tasks));
@@ -1713,7 +1737,6 @@ try {
         loadDims().forEach(function (d) {
           tr.appendChild(el("td", "num" + (p[d.field] ? "" : " muted"), fmt(p[d.field])));
         });
-        tr.appendChild(el("td", "num" + (p.bugs ? "" : " muted"), fmt(p.bugs)));
         tb.appendChild(tr);
       });
     });
@@ -1731,12 +1754,12 @@ try {
     { key: "kind",     label: "Kind",      num: false, options: function () { return uniq("kind"); } },
     { key: "state",    label: "State",     num: false, options: function () { return uniq("state"); } },
     { key: "assignee", label: "Assignee",  num: false, options: function () { return uniq("assignee"); } },
-    { key: "product",  label: "Product",   num: false, options: function () { return uniq("product"); } },
     { key: "changedDays", label: "Last change", num: true },
     // num:true keeps it sortable and filterable with >/< expressions;
     // align:"center" only changes where it sits in the column.
     { key: "daysLeft",    label: "Target",      num: true, align: "center" },
     { key: "disc",        label: "",             num: false, noSort: true, noFilter: true, align: "center" },
+    { key: "bugs",        label: "Bugs",         num: true },
     { key: "cases",    label: "Cases",     num: true },
     { key: "exec",     label: "Points",    num: true },
     { key: "passed",   label: "Passed",    num: true },
@@ -1759,6 +1782,7 @@ try {
     if (key === "passRate")    return task.passRate < 0 ? null : task.passRate * 100;
     if (key === "changedDays") return task.changedDays < 0 ? null : task.changedDays;
     if (key === "daysLeft")    return task.targetOn ? task.daysLeft : null;   // no target = no value
+    if (key === "bugs")        return task.bugIds ? task.bugIds.split(",").filter(Boolean).length : 0;
     return task[key];
   }
 
@@ -1946,7 +1970,6 @@ try {
       tr.appendChild(stTd);
 
       tr.appendChild(el("td", "nowrap", task.assignee));
-      tr.appendChild(el("td", "nowrap", task.product));
 
       var chg = el("td", "num nowrap");
       if (task.changedDays < 0) {
@@ -1977,6 +2000,9 @@ try {
         discTd.textContent = GL.mdash;
       }
       tr.appendChild(discTd);
+
+      var bugCount = task.bugIds ? task.bugIds.split(",").filter(Boolean).length : 0;
+      tr.appendChild(el("td", "num" + (bugCount ? "" : " muted"), fmt(bugCount)));
 
       tr.appendChild(el("td", "num", fmt(task.cases)));
 
@@ -2199,10 +2225,6 @@ try {
     }
 
     content.appendChild(section("Task #" + task.id, task.taskDisc));
-    if (task.pbiId) {
-      var pbiWho = "PBI" + (task.pbiTitle ? " " + GL.mdash + " " + task.pbiTitle : " " + task.pbiId);
-      content.appendChild(section(pbiWho, task.pbiDisc));
-    }
 
     $("discOverlay").classList.remove("hidden");
     $("discClose").focus();

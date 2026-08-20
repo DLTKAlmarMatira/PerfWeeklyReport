@@ -48,7 +48,7 @@ missing or half-written data.
 | 1 | `1-Get-TestPlanResults.ps1` | yes | `csv\test_plan_results.csv` |
 | 2 | `2-Get-AdoQueryResults.ps1` | yes | `csv\pbi_task_links.csv` |
 | 3 | `3-Get-TaskTestsLinkResults.ps1` | yes | `csv\task_tests_link_results.csv` |
-| 4 | `8-Get-PbiBugLinks.ps1` | yes | `csv\pbi_bug_links.csv` |
+| 4 | `8-Get-PbiBugLinks.ps1` | yes | `csv\pbi_bug_links.csv` + `csv\task_bug_links.csv` |
 | 5 | `6-Build-WeeklyReports.ps1` | **no** | 4 derived CSVs (below) |
 | 6 | `7-Build-MeetingReport.ps1` | **no** | `weekly_meeting_report.html` |
 
@@ -72,9 +72,10 @@ authoritative list of who is working on what.
 to which Test Cases and Test Plans, and by what link type. This is where an incorrectly
 used `Child` link (instead of `Tests`) becomes visible.
 
-**4 — PBI → Bug links.** Bugs hang off a PBI with a plain `Related` link, which the saved
-query in step 2 does not return — it asks only for Parent/Child. This step walks the
-relations through the REST API instead, so nobody has to edit the ADO query.
+**4 — Bug links.** Bugs can hang off either a PBI or directly off a Task with a plain
+`Related` link — neither is returned by the saved queries (which ask only for Parent/Child).
+This step walks the relations through the REST API and writes two files:
+`pbi_bug_links.csv` (PBI-level) and `task_bug_links.csv` (Task-level).
 
 **5 — Weekly reports.** Joins the three raw extracts into the derived reporting CSVs.
 No network, no credentials.
@@ -98,6 +99,7 @@ csv\test_plan_results.csv
 csv\pbi_task_links.csv
 csv\task_tests_link_results.csv
 csv\pbi_bug_links.csv
+csv\task_bug_links.csv
 ```
 
 **Derived reports** — fully recomputable from the above, so they are *not* committed.

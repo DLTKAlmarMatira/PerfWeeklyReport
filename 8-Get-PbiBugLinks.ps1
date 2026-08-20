@@ -150,72 +150,170 @@ try {
     Write-Host ("Related links found: {0} across {1} PBI(s)" -f $links.Count,
         (@($links | Select-Object -ExpandProperty PbiId -Unique)).Count)
 
-    if ($links.Count -eq 0) {
-        Write-Warning 'No Related links on any PBI - nothing to write.'
-        @() | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-        return
-    }
-
-    # --- 2. resolve each distinct target. Project-scoped batch returns full
-    # --- fields for in-project items; anything it refuses is recorded as
-    # --- unreadable rather than dropped.
-    $targets = @($links | Select-Object -ExpandProperty TargetId -Unique)
+    # --- 2. resolve PBI-level targets and write pbi_bug_links.csv
+    # --- $info is shared with the task pass below (avoids re-fetching targets
+    # --- that appear in both PBI-level and task-level Related links).
     $info = @{}
-    for ($i = 0; $i -lt $targets.Count; $i += 100) {
-        $chunk = @($targets[$i..([Math]::Min($i + 99, $targets.Count - 1))])
-        $body = @{ ids = $chunk
-                   fields = @('System.Id','System.WorkItemType','System.Title','System.State','System.AssignedTo')
-                   errorPolicy = 'omit' } | ConvertTo-Json
-        try {
-            $resp = Invoke-Ado -Uri "$BaseUrl/$Project/_apis/wit/workitemsbatch?api-version=$ApiVersion" -Method Post -Body $body
-            foreach ($item in @($resp.value)) {
-                if (-not $item.fields.'System.WorkItemType') { continue }   # empty stub = no read access
-                $info[[string]$item.id] = $item.fields
-            }
-        } catch {
-            # errorPolicy=omit is not honoured everywhere; fall back to one
-            # call per id so a single unreadable item can't blank the batch.
-            foreach ($id in $chunk) {
-                try {
-                    $one = Invoke-Ado -Uri "$BaseUrl/$Project/_apis/wit/workitems/$id`?api-version=$ApiVersion"
-                    if ($one.fields.'System.WorkItemType') { $info[[string]$id] = $one.fields }
-                } catch { }
+    if ($links.Count -gt 0) {
+        $targets = @($links | Select-Object -ExpandProperty TargetId -Unique)
+        for ($i = 0; $i -lt $targets.Count; $i += 100) {
+            $chunk = @($targets[$i..([Math]::Min($i + 99, $targets.Count - 1))])
+            $body = @{ ids = $chunk
+                       fields = @('System.Id','System.WorkItemType','System.Title','System.State','System.AssignedTo')
+                       errorPolicy = 'omit' } | ConvertTo-Json
+            try {
+                $resp = Invoke-Ado -Uri "$BaseUrl/$Project/_apis/wit/workitemsbatch?api-version=$ApiVersion" -Method Post -Body $body
+                foreach ($item in @($resp.value)) {
+                    if (-not $item.fields.'System.WorkItemType') { continue }   # empty stub = no read access
+                    $info[[string]$item.id] = $item.fields
+                }
+            } catch {
+                # errorPolicy=omit is not honoured everywhere; fall back to one
+                # call per id so a single unreadable item can't blank the batch.
+                foreach ($id in $chunk) {
+                    try {
+                        $one = Invoke-Ado -Uri "$BaseUrl/$Project/_apis/wit/workitems/$id`?api-version=$ApiVersion"
+                        if ($one.fields.'System.WorkItemType') { $info[[string]$id] = $one.fields }
+                    } catch { }
+                }
             }
         }
-    }
 
-    $rows = foreach ($l in $links) {
-        $f = $info[$l.TargetId]
-        [pscustomobject][ordered]@{
-            'PBI ID'            = $l.PbiId
-            'PBI Title'         = $pbiTitle[$l.PbiId]
-            'Target ID'         = $l.TargetId
-            'Target Type'       = if ($f) { [string]$f.'System.WorkItemType' } else { '' }
-            'Target Title'      = if ($f) { [string]$f.'System.Title' } else { '' }
-            'Target State'      = if ($f) { [string]$f.'System.State' } else { '' }
-            'Target AssignedTo' = if ($f) { Get-DisplayName $f.'System.AssignedTo' } else { '' }
-            'Readable'          = if ($f) { 'True' } else { 'False' }
-            'Project GUID'      = $l.ProjectGuid
-            'Link Type'         = $l.Rel
+        $rows = foreach ($l in $links) {
+            $f = $info[$l.TargetId]
+            [pscustomobject][ordered]@{
+                'PBI ID'            = $l.PbiId
+                'PBI Title'         = $pbiTitle[$l.PbiId]
+                'Target ID'         = $l.TargetId
+                'Target Type'       = if ($f) { [string]$f.'System.WorkItemType' } else { '' }
+                'Target Title'      = if ($f) { [string]$f.'System.Title' } else { '' }
+                'Target State'      = if ($f) { [string]$f.'System.State' } else { '' }
+                'Target AssignedTo' = if ($f) { Get-DisplayName $f.'System.AssignedTo' } else { '' }
+                'Readable'          = if ($f) { 'True' } else { 'False' }
+                'Project GUID'      = $l.ProjectGuid
+                'Link Type'         = $l.Rel
+            }
         }
+        $rows = @($rows)
+        $rows | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+        Write-Host ("Wrote {0} ({1} rows)" -f $OutputPath, $rows.Count)
+
+        $bugs      = @($rows | Where-Object { $_.'Target Type' -eq 'Bug' })
+        $unreadable= @($rows | Where-Object { $_.Readable -eq 'False' })
+        Write-Host ''
+        Write-Host ("  Bugs linked          : {0} (across {1} PBI)" -f $bugs.Count,
+            (@($bugs | Select-Object -ExpandProperty 'PBI ID' -Unique)).Count)
+        Write-Host  '  Related targets by type (PBI-level):'
+        $rows | Group-Object 'Target Type' | Sort-Object Count -Descending | ForEach-Object {
+            $label = if ($_.Name) { $_.Name } else { '(unreadable)' }
+            Write-Host ("     {0,-22} {1}" -f $label, $_.Count)
+        }
+        if ($unreadable.Count -gt 0) {
+            Write-Warning ("{0} related target(s) are in another project and not readable with these credentials - they are recorded with Readable=False and will NOT be counted as bugs." -f $unreadable.Count)
+        }
+    } else {
+        Write-Warning 'No Related links on any PBI - writing empty file.'
+        @() | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
     }
-    $rows = @($rows)
 
-    $rows | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-    Write-Host ("Wrote {0} ({1} rows)" -f $OutputPath, $rows.Count)
-
-    $bugs      = @($rows | Where-Object { $_.'Target Type' -eq 'Bug' })
-    $unreadable= @($rows | Where-Object { $_.Readable -eq 'False' })
+    # --- 3. task-level Related links. Bugs can also hang directly off a Task.
+    # --- Same batch approach; reuses $info from the PBI pass to avoid re-fetching
+    # --- targets that were already resolved above.
     Write-Host ''
-    Write-Host ("  Bugs linked          : {0} (across {1} PBI)" -f $bugs.Count,
-        (@($bugs | Select-Object -ExpandProperty 'PBI ID' -Unique)).Count)
-    Write-Host  '  Related targets by type:'
-    $rows | Group-Object 'Target Type' | Sort-Object Count -Descending | ForEach-Object {
-        $label = if ($_.Name) { $_.Name } else { '(unreadable)' }
-        Write-Host ("     {0,-22} {1}" -f $label, $_.Count)
+    $allRows = @(Import-Csv -LiteralPath $pbiPath)
+    $taskTitle = @{}
+    $taskPbi   = @{}
+    foreach ($r in $allRows) {
+        if ($r.'Target System.WorkItemType' -eq 'Task' -and $r.'Target ID') {
+            $taskTitle[$r.'Target ID'] = $r.'Target System.Title'
+            $taskPbi[$r.'Target ID']   = $r.'Source ID'
+        }
     }
-    if ($unreadable.Count -gt 0) {
-        Write-Warning ("{0} related target(s) are in another project and not readable with these credentials - they are recorded with Readable=False and will NOT be counted as bugs." -f $unreadable.Count)
+    $taskIds = @($taskTitle.Keys | Sort-Object)
+    Write-Host ("Tasks to inspect: {0}" -f $taskIds.Count)
+
+    $taskLinks = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $taskIds.Count; $i += 20) {
+        $chunk = @($taskIds[$i..([Math]::Min($i + 19, $taskIds.Count - 1))])
+        $body = @{ ids = $chunk; '$expand' = 'relations' } | ConvertTo-Json
+        $resp = Invoke-Ado -Uri "$BaseUrl/$Project/_apis/wit/workitemsbatch?api-version=$ApiVersion" -Method Post -Body $body
+        foreach ($item in @($resp.value)) {
+            foreach ($rel in @($item.relations)) {
+                if ($rel.rel -notlike 'System.LinkTypes.Related*') { continue }
+                $targetId = ($rel.url -split '/')[-1]
+                if ($targetId -notmatch '^\d+$') { continue }
+                $projGuid = ''
+                if ($rel.url -match '/([0-9a-fA-F-]{36})/_apis/') { $projGuid = $Matches[1] }
+                $taskLinks.Add([pscustomobject]@{
+                    TaskId = [string]$item.id; TargetId = $targetId; ProjectGuid = $projGuid; Rel = $rel.rel
+                })
+            }
+        }
+    }
+    Write-Host ("Task Related links found: {0} across {1} Task(s)" -f $taskLinks.Count,
+        (@($taskLinks | Select-Object -ExpandProperty TaskId -Unique)).Count)
+
+    $taskBugPath = Join-Path $CsvDir 'task_bug_links.csv'
+    if ($taskLinks.Count -eq 0) {
+        Write-Warning 'No Related links on any Task - writing empty file.'
+        @() | Export-Csv -Path $taskBugPath -NoTypeInformation -Encoding UTF8
+    } else {
+        # Resolve any targets not already in $info from the PBI pass above.
+        $newTargets = @($taskLinks | Select-Object -ExpandProperty TargetId -Unique |
+                        Where-Object { -not $info.ContainsKey($_) })
+        for ($i = 0; $i -lt $newTargets.Count; $i += 100) {
+            $chunk = @($newTargets[$i..([Math]::Min($i + 99, $newTargets.Count - 1))])
+            $body = @{ ids = $chunk
+                       fields = @('System.Id','System.WorkItemType','System.Title','System.State','System.AssignedTo')
+                       errorPolicy = 'omit' } | ConvertTo-Json
+            try {
+                $resp = Invoke-Ado -Uri "$BaseUrl/$Project/_apis/wit/workitemsbatch?api-version=$ApiVersion" -Method Post -Body $body
+                foreach ($item in @($resp.value)) {
+                    if (-not $item.fields.'System.WorkItemType') { continue }
+                    $info[[string]$item.id] = $item.fields
+                }
+            } catch {
+                foreach ($id in $chunk) {
+                    try {
+                        $one = Invoke-Ado -Uri "$BaseUrl/$Project/_apis/wit/workitems/$id`?api-version=$ApiVersion"
+                        if ($one.fields.'System.WorkItemType') { $info[[string]$id] = $one.fields }
+                    } catch { }
+                }
+            }
+        }
+
+        $taskRows = foreach ($l in $taskLinks) {
+            $f = $info[$l.TargetId]
+            [pscustomobject][ordered]@{
+                'Task ID'           = $l.TaskId
+                'Task Title'        = $taskTitle[$l.TaskId]
+                'Target ID'         = $l.TargetId
+                'Target Type'       = if ($f) { [string]$f.'System.WorkItemType' } else { '' }
+                'Target Title'      = if ($f) { [string]$f.'System.Title' } else { '' }
+                'Target State'      = if ($f) { [string]$f.'System.State' } else { '' }
+                'Target AssignedTo' = if ($f) { Get-DisplayName $f.'System.AssignedTo' } else { '' }
+                'Readable'          = if ($f) { 'True' } else { 'False' }
+                'Project GUID'      = $l.ProjectGuid
+                'Link Type'         = $l.Rel
+            }
+        }
+        $taskRows = @($taskRows)
+        $taskRows | Export-Csv -Path $taskBugPath -NoTypeInformation -Encoding UTF8
+        Write-Host ("Wrote {0} ({1} rows)" -f $taskBugPath, $taskRows.Count)
+
+        $taskBugs   = @($taskRows | Where-Object { $_.'Target Type' -eq 'Bug' })
+        $taskUnread = @($taskRows | Where-Object { $_.Readable -eq 'False' })
+        Write-Host ''
+        Write-Host ("  Bugs linked          : {0} (across {1} Task)" -f $taskBugs.Count,
+            (@($taskBugs | Select-Object -ExpandProperty 'Task ID' -Unique)).Count)
+        Write-Host  '  Related targets by type (Task-level):'
+        $taskRows | Group-Object 'Target Type' | Sort-Object Count -Descending | ForEach-Object {
+            $label = if ($_.Name) { $_.Name } else { '(unreadable)' }
+            Write-Host ("     {0,-22} {1}" -f $label, $_.Count)
+        }
+        if ($taskUnread.Count -gt 0) {
+            Write-Warning ("{0} task-related target(s) are in another project and not readable with these credentials - they are recorded with Readable=False and will NOT be counted as bugs." -f $taskUnread.Count)
+        }
     }
 }
 catch {

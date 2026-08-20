@@ -99,11 +99,12 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo [4/7] PBI to Bug "Related" links
+echo [4/7] PBI and Task "Related" (Bug) links
 echo ========================================
-rem Bugs hang off a PBI with a plain "Related" link, which the saved query in
-rem step 2 does NOT return - it asks only for Parent/Child. This step walks the
-rem relations through the REST API instead, so no ADO query edit is needed.
+rem Bugs can hang off either a PBI or directly off a Task via a plain "Related"
+rem link. Neither link type is returned by the saved query in step 2 (which asks
+rem only for Parent/Child). This step walks the relations through the REST API
+rem and writes pbi_bug_links.csv (PBI-level) and task_bug_links.csv (Task-level).
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%8-Get-PbiBugLinks.ps1" -CsvDir "%OUTDIR%"
 if errorlevel 1 (
     echo.
