@@ -148,6 +148,15 @@ function Get-TaskKind {
     return 'Other'
 }
 
+function Get-Numeric {
+    param([string]$v)
+    $n = 0.0
+    if (-not [string]::IsNullOrWhiteSpace($v) -and
+        [double]::TryParse($v.Trim(), [System.Globalization.NumberStyles]::Any,
+            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { $n }
+    else { 0.0 }
+}
+
 try {
     $connectedPath = Join-Path $CsvDir 'connected_pbi_task_test_results.csv'
     if (-not (Test-Path -LiteralPath $connectedPath)) {
@@ -219,7 +228,9 @@ try {
         Write-Warning "task_bug_links.csv not found - task-level bug counts will be blank. Run 8-Get-PbiBugLinks.ps1."
     }
 
-    # --- Latest discussion entry per work item, from 9-Get-WorkItemComments.ps1.
+    # --- All discussion entries per work item, from 9-Get-WorkItemComments.ps1.
+    # --- Rows arrive oldest-first (the order script 9 emits them). The list is
+    # --- kept in that order; discDays uses the last (most-recent) entry.
     # --- Optional: if the CSV is absent the pipeline still completes and the
     # --- HTML report renders normally - discussion icons simply do not appear.
     $commentsByItem = @{}
@@ -227,14 +238,18 @@ try {
     if (Test-Path -LiteralPath $commentsPath) {
         foreach ($r in (Import-Csv -LiteralPath $commentsPath)) {
             if ($r.WorkItemId -and $r.CommentHtml) {
-                $commentsByItem[$r.WorkItemId] = [pscustomobject]@{
+                if (-not $commentsByItem.ContainsKey($r.WorkItemId)) {
+                    $commentsByItem[$r.WorkItemId] = [System.Collections.Generic.List[object]]::new()
+                }
+                $commentsByItem[$r.WorkItemId].Add([pscustomobject]@{
                     author = [string]$r.Author
                     date   = Get-DateOnly $r.Date
                     html   = [string]$r.CommentHtml
-                }
+                })
             }
         }
-        Write-Host ("Discussion entries loaded: {0} work item(s)" -f $commentsByItem.Count)
+        $totalComments = ($commentsByItem.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+        Write-Host ("Discussion entries loaded: {0} comment(s) across {1} work item(s)" -f $totalComments, $commentsByItem.Count)
     } else {
         Write-Warning "workitem_comments.csv not found - discussion icons will be absent. Run 9-Get-WorkItemComments.ps1."
     }
@@ -284,12 +299,13 @@ try {
     function New-TaskRecord {
         param([string]$Id, [string]$Title, [string]$State, [string]$Kind,
               [string]$Assignee, [string]$Product, [string]$PbiId, [string]$PbiTitle,
-              [string]$PbiStart, [string]$PbiTarget)
+              [string]$PbiStart, [string]$PbiTarget, [string]$RemWork = '')
         if ([string]::IsNullOrWhiteSpace($Assignee)) { $Assignee = '(unassigned)' }
         [pscustomobject]@{
             id = $Id; title = $Title; state = $State; kind = $Kind
             assignee = $Assignee; product = $Product; pbiId = $PbiId; pbiTitle = $PbiTitle
             pbiStart = $PbiStart; pbiTarget = $PbiTarget
+            remWork   = Get-Numeric $RemWork
             CaseSet   = [System.Collections.Generic.HashSet[string]]::new()
             TesterSet = [System.Collections.Generic.HashSet[string]]::new()
             exec = 0; passed = 0; failed = 0; blocked = 0; na = 0; never = 0; mistakes = 0
@@ -308,7 +324,8 @@ try {
             -Product (Get-ProductFromIteration $link.'Target System.IterationPath') `
             -PbiId $link.'Source ID' -PbiTitle $link.'Source System.Title' `
             -PbiStart  ([string]$link.'Source System.CreatedDate') `
-            -PbiTarget ([string]$link.'Source Deltek.PlanHotFixRelDt')
+            -PbiTarget ([string]$link.'Source Deltek.PlanHotFixRelDt') `
+            -RemWork   ([string]$link.'Target Microsoft.VSTS.Scheduling.RemainingWork')
     }
 
     foreach ($row in $connected) {
@@ -327,6 +344,7 @@ try {
                 pbiTitle  = $row.'PBI Title'
                 pbiStart  = [string]$row.'PBI Start'
                 pbiTarget = [string]$row.'PBI Target'
+                remWork   = 0.0
                 CaseSet   = [System.Collections.Generic.HashSet[string]]::new()
                 TesterSet = [System.Collections.Generic.HashSet[string]]::new()
                 exec      = 0
@@ -419,17 +437,19 @@ try {
             na       = $t.na
             never    = $t.never
             mistakes = $t.mistakes
-            discDays = if ($commentsByItem.ContainsKey($t.id)) { Get-DaysSince $commentsByItem[$t.id].date } else { -1 }
+            remWork  = [double]$t.remWork
+            discDays = $(
+                $discList = $commentsByItem[$t.id]
+                if ($discList -and $discList.Count) { Get-DaysSince $discList[$discList.Count - 1].date } else { -1 }
+            )
             taskDisc = $(
                 $tc = $commentsByItem[$t.id]
-                if ($tc) { [pscustomobject]@{ author = $tc.author; date = $tc.date; html = $tc.html } }
-                else { $null }
+                if ($tc -and $tc.Count) { @($tc) } else { $null }
             )
             pbiDisc = $(
                 if ($t.pbiId) {
                     $pc = $commentsByItem[$t.pbiId]
-                    if ($pc) { [pscustomobject]@{ author = $pc.author; date = $pc.date; html = $pc.html } }
-                    else { $null }
+                    if ($pc -and $pc.Count) { @($pc) } else { $null }
                 } else { $null }
             )
         }
@@ -758,6 +778,19 @@ try {
   .disc-body p { margin: 0 0 6px; }
   .disc-body p:last-child { margin-bottom: 0; }
   .disc-none { color: var(--ink-muted); font-style: italic; font-size: 13px; }
+  .disc-entry + .disc-entry { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
+  /* ---- Team Capacity bars ---- */
+  .cap-section { display: flex; flex-direction: column; gap: 4px; }
+  .cap-row  { display: grid; grid-template-columns: 152px 1fr 200px; gap: 12px; align-items: center; padding: 6px 4px; border-radius: 6px; }
+  .cap-info  { font-size: 12px; font-variant-numeric: tabular-nums; }
+  .cap-rate  { font-weight: 600; display: block; }
+  .cap-rate.ok   { color: var(--st-good); }
+  .cap-rate.warn { color: #fab219; }
+  .cap-rate.over { color: var(--st-critical); }
+  .cap-detail { color: var(--ink-muted); font-size: 11px; }
+  .cap-empty  { color: var(--ink-muted); font-style: italic; font-size: 13px; }
+  .cap-scale  { display: flex; justify-content: space-between; padding-left: 164px; margin-top: 8px; font-size: 11px; color: var(--ink-muted); border-top: 1px solid var(--grid); padding-top: 4px; }
+  .cap-col-head { padding-left: 8px; white-space: nowrap; }
   .tasktitle { font-weight: 500; }
   td.nowrap { white-space: nowrap; }
 
@@ -1536,7 +1569,8 @@ try {
       var k = t[state.loadGroup] || "(none)";
       if (!map[k]) {
         map[k] = { name: k, total: 0, pbis: Object.create(null), soonest: null, soonestOn: "",
-                   bugSet: Object.create(null) };
+                   bugSet: Object.create(null),
+                   capRate: 0, capRem: 0 };
         STATES.forEach(function (s) { map[k][s.key] = 0; });
         URGENCY.forEach(function (u) { map[k]["u_" + u.key] = 0; });
         order.push(k);
@@ -1554,6 +1588,11 @@ try {
       if (t.targetOn && t.state !== "Done" && (g.soonest === null || t.daysLeft < g.soonest)) {
         g.soonest = t.daysLeft; g.soonestOn = t.targetOn;
       }
+      if (t.state !== "Done" && t.remWork > 0 && t.daysLeft < 99999) {
+        var effDays = Math.max(t.daysLeft, 1);
+        g.capRate += t.remWork / effDays;
+        g.capRem  += t.remWork;
+      }
       var pk = t.pbiId || "(no PBI parent)";
       if (!g.pbis[pk]) {
         g.pbis[pk] = { id: t.pbiId, title: t.pbiTitle || "(no PBI parent)", product: t.product || "", tasks: 0,
@@ -1561,7 +1600,8 @@ try {
                        windowDays: t.windowDays, closedDays: null, closedOn: "",
                        // Bugs hang off the PBI, so every task of a PBI reports
                        // the same set - take it, don't accumulate it.
-                       bugs: t.bugIds ? t.bugIds.split(",").filter(Boolean).length : 0 };
+                       bugs: t.bugIds ? t.bugIds.split(",").filter(Boolean).length : 0,
+                       capRem: 0, capRate: 0 };
         STATES.forEach(function (s) { g.pbis[pk][s.key] = 0; });
         URGENCY.forEach(function (u) { g.pbis[pk]["u_" + u.key] = 0; });
       }
@@ -1569,6 +1609,11 @@ try {
       if (g.pbis[pk][t.state] === undefined) g.pbis[pk][t.state] = 0;
       g.pbis[pk][t.state]++;
       g.pbis[pk]["u_" + urgencyOf(t)]++;
+      if (t.state !== "Done" && t.remWork > 0 && t.daysLeft < 99999) {
+        var effDays = Math.max(t.daysLeft, 1);
+        g.pbis[pk].capRem  += t.remWork;
+        g.pbis[pk].capRate += t.remWork / effDays;
+      }
       // A PBI finishes when its LAST task does, i.e. the most recent close =
       // the SMALLEST closedDays (fewest days ago).
       if (t.closedDays >= 0 && (g.pbis[pk].closedDays === null || t.closedDays < g.pbis[pk].closedDays)) {
@@ -1669,10 +1714,17 @@ try {
     var host = $("loadTable");
     host.textContent = "";
     var t = el("table"), thead = el("thead"), hr = el("tr");
+
+    var hasAnyCap = groups.some(function (g) { return g.capRate > 0; });
+    var totalCols = 4 + (hasAnyCap ? 1 : 0) + loadDims().length;
+
     // Target (index 2) is centred to match the meter cells meterCell() emits.
     [state.loadGroup === "assignee" ? "Person" : "Product", "PBI", "Product", "Target"].forEach(function (h, i) {
       hr.appendChild(el("th", i === 3 ? "ctr" : null, h));
     });
+    if (hasAnyCap) {
+      hr.appendChild(el("th", "cap-col-head", "Burn Rate"));
+    }
     // State-breakdown columns (To Do / In Progress / Done) carry the legend
     // swatch so the table shares the same colour encoding as the bars above.
     loadDims().forEach(function (d) {
@@ -1690,22 +1742,29 @@ try {
     groups.forEach(function (g) {
       var pbis = Object.keys(g.pbis).map(function (k) { return g.pbis[k]; })
                        .sort(function (a, b) { return b.tasks - a.tasks; });
-      // Subtotal row per group, then one row per PBI beneath it.
+
+      // --- group (subtotal) row ---
       var sr = el("tr");
-      var nameCell = el("td", null, g.name);
+      var nameCell = el("td");
       nameCell.style.fontWeight = "600";
+      nameCell.textContent = g.name;
       sr.appendChild(nameCell);
       sr.appendChild(el("td", "muted", fmt(pbis.length) + " PBI" + (pbis.length === 1 ? "" : "s")));
       sr.appendChild(el("td"));
-      // Target stays BLANK on the group row. It is a PBI-level date, so putting
-      // one PBI's deadline on a row that represents many would read as though
-      // the whole group shared it. Blank rather than a dash, because a dash
-      // means "no target set" on the PBI rows below. The soonest live deadline
-      // is still available - it is in the bar's tooltip, labelled as such.
+      // Target stays BLANK on the group row - it is a PBI-level date.
       sr.appendChild(el("td", "ctr"));
+      if (hasAnyCap) {
+        if (g.capRate > 0) {
+          var cls = g.capRate > 7 ? "over" : g.capRate > 4 ? "warn" : "ok";
+          sr.appendChild(el("td", "cap-rate " + cls, g.capRate.toFixed(1) + " h/day"));
+        } else {
+          sr.appendChild(el("td", "muted", GL.mdash));
+        }
+      }
       loadDims().forEach(function (d) { sr.appendChild(el("td", "num", fmt(g[d.field]))); });
       tb.appendChild(sr);
 
+      // --- PBI rows ---
       pbis.forEach(function (p) {
         var pbiKey = p.id || "(no PBI parent)";
         var isSelected = state.selectedPbiKey === pbiKey;
@@ -1732,6 +1791,15 @@ try {
         // Target belongs on the PBI row - that is the level the date is set at.
         // A PBI counts as done only when every one of its tasks is.
         tr.appendChild(meterCell(p, p["Done"] === p.tasks));
+        if (hasAnyCap) {
+          var isDone = p["Done"] === p.tasks;
+          if (!isDone && p.capRate > 0) {
+            var pcls = p.capRate > 7 ? "over" : p.capRate > 4 ? "warn" : "ok";
+            tr.appendChild(el("td", "cap-rate " + pcls, p.capRate.toFixed(1)));
+          } else {
+            tr.appendChild(el("td", "muted", GL.mdash));
+          }
+        }
         // Real per-PBI counts. A zero is dimmed rather than dashed - a dash
         // reads as "no data", but 0 here is a genuine, known count.
         loadDims().forEach(function (d) {
@@ -1987,11 +2055,11 @@ try {
       tr.appendChild(meterCell(task, task.state === "Done"));
 
       var discTd = el("td", "ctr");
-      if (task.taskDisc || task.pbiDisc) {
+      if ((task.taskDisc && task.taskDisc.length) || (task.pbiDisc && task.pbiDisc.length)) {
         var dBtn = document.createElement("button");
         dBtn.className = "disc-btn";
-        dBtn.title = "View latest discussion";
-        dBtn.setAttribute("aria-label", "Latest discussion for " + task.title);
+        dBtn.title = "View discussion";
+        dBtn.setAttribute("aria-label", "Discussion for " + task.title);
         dBtn.innerHTML = '<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M2 1h12a1 1 0 011 1v8a1 1 0 01-1 1H9l-3 3-3-3H2a1 1 0 01-1-1V2a1 1 0 011-1z"/></svg>';
         (function (t) { dBtn.addEventListener("click", function (e) { e.stopPropagation(); showDisc(t); }); })(task);
         discTd.appendChild(dBtn);
@@ -2209,15 +2277,22 @@ try {
     var content = $("discContent");
     content.textContent = "";
 
-    function section(who, disc) {
+    function section(who, discs) {
       var sec = el("div", "disc-section");
       sec.appendChild(el("div", "disc-who", who));
-      if (disc && disc.html) {
-        var byLine = (disc.author || "") + (disc.date ? "  " + GL.dot + "  " + disc.date : "");
-        if (byLine.trim()) sec.appendChild(el("div", "disc-meta", byLine));
-        var body = el("div", "disc-body");
-        body.innerHTML = disc.html;
-        sec.appendChild(body);
+      if (discs && discs.length) {
+        // Newest first
+        var reversed = discs.slice().reverse();
+        reversed.forEach(function (disc) {
+          if (!disc || !disc.html) return;
+          var entry = el("div", "disc-entry");
+          var byLine = (disc.author || "") + (disc.date ? "  " + GL.dot + "  " + disc.date : "");
+          if (byLine.trim()) entry.appendChild(el("div", "disc-meta", byLine));
+          var body = el("div", "disc-body");
+          body.innerHTML = disc.html;
+          entry.appendChild(body);
+          sec.appendChild(entry);
+        });
       } else {
         sec.appendChild(el("div", "disc-none", "No discussion entries."));
       }

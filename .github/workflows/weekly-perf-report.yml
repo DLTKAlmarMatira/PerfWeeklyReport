@@ -3,9 +3,9 @@ name: Weekly Performance Report
 # Runs Run-AdoExtracts.bat (the ADO extraction + report-build pipeline) and
 # emails the resulting HTML report + CSVs.
 #
-# SCHEDULE: cron below is 01:07 UTC every Tuesday, which is 9:07 AM
+# SCHEDULE: cron below is 00:07 UTC every Tuesday, which is 8:07 AM
 # Philippine Time (UTC+8). The Philippines does not observe daylight saving,
-# so this stays fixed at 9:07 AM PH Time year-round - no seasonal drift to
+# so this stays fixed at 8:07 AM PH Time year-round - no seasonal drift to
 # worry about. Offset by 7 minutes off the top of the hour on purpose:
 # GitHub explicitly calls out the top of every hour as the highest-load time
 # for scheduled workflows, so this dodges most of that queuing delay. Edit
@@ -33,7 +33,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: '7 6 * * 2'
+    - cron: '7 0 * * 2'
   workflow_dispatch: {}
 
 jobs:

@@ -1,16 +1,13 @@
 <#
 .SYNOPSIS
-    Fetches the latest discussion entry for each PBI and Task in the pipeline.
+    Fetches all discussion entries for each PBI and Task in the pipeline.
 
 .DESCRIPTION
-    The weekly HTML report can display the most recent comment left on each work
-    item. This script walks the work item updates API to find it. It reads the
-    PBI/Task IDs from pbi_task_links.csv (produced by step 2) and writes one
-    row per work item that has at least one discussion entry.
-
-    Only the most-recent update that carries a System.History value is captured.
-    Items with no discussion at all are omitted (the report simply shows no icon
-    for those rows).
+    The weekly HTML report displays all comments left on each work item. This
+    script walks the work item updates API and emits one row per comment
+    (oldest first) for every work item that has at least one discussion entry.
+    Items with no discussion at all are omitted (the report shows no icon for
+    those rows).
 
     Unreadable items (e.g. cross-project work items, permission gaps) are
     silently skipped rather than hard-failing the pipeline.
@@ -129,19 +126,22 @@ try {
 
             if ($withHistory.Count -eq 0) { $skipped++; continue }
 
-            $latest = $withHistory[-1]   # last = most recent
-            $commentHtml = [string]$latest.fields.'System.History'.newValue
-            $author = if ($latest.revisedBy -and $latest.revisedBy.displayName) {
-                          [string]$latest.revisedBy.displayName
-                      } else { '' }
-            $date = if ($latest.revisedDate) { [string]$latest.revisedDate } else { '' }
+            # Emit one row per comment, oldest first. Script 7 builds a per-item
+            # list in this same order and uses the last entry for discDays.
+            foreach ($entry in $withHistory) {
+                $commentHtml = [string]$entry.fields.'System.History'.newValue
+                $author = if ($entry.revisedBy -and $entry.revisedBy.displayName) {
+                              [string]$entry.revisedBy.displayName
+                          } else { '' }
+                $date = if ($entry.revisedDate) { [string]$entry.revisedDate } else { '' }
 
-            $results.Add([pscustomobject][ordered]@{
-                WorkItemId  = $id
-                Author      = $author
-                Date        = $date
-                CommentHtml = $commentHtml
-            })
+                $results.Add([pscustomobject][ordered]@{
+                    WorkItemId  = $id
+                    Author      = $author
+                    Date        = $date
+                    CommentHtml = $commentHtml
+                })
+            }
             $found++
         } catch {
             Write-Warning ("Skipped work item {0}: {1}" -f $id, $_.Exception.Message)
@@ -150,8 +150,9 @@ try {
     }
 
     Write-Host ''
-    Write-Host ("Discussion entries found : {0}" -f $found)
-    Write-Host ("No discussion / skipped  : {0}" -f $skipped)
+    Write-Host ("Work items with discussion: {0}" -f $found)
+    Write-Host ("Total comment rows written: {0}" -f $results.Count)
+    Write-Host ("No discussion / skipped   : {0}" -f $skipped)
 
     $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
     Write-Host ("Wrote {0} ({1} rows)" -f $OutputPath, $results.Count)
