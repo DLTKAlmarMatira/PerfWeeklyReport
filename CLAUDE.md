@@ -24,43 +24,83 @@ powershell -File 7-Build-MeetingReport.ps1 -Show     # -Show opens in browser
 # Diagnostic: verify fields before adding to EXTRA_FIELDS
 powershell -File 4-Get-AdoWorkItemTypeFields.ps1 -OutputPath csv\workitemtype_fields.csv
 
+# Per-person sprint capacity (discover teams/iterations first, then pull)
+powershell -File 5-Get-AdoIterationCapacity.ps1 -ListTeams
+powershell -File 5-Get-AdoIterationCapacity.ps1 -ListIterations
+powershell -File 5-Get-AdoIterationCapacity.ps1 -IterationPath "QEAutomation\Costpoint"
+
 # Re-pull one extract individually
 powershell -NoProfile -ExecutionPolicy Bypass -File 1-Get-TestPlanResults.ps1 -OutputPath csv\test_plan_results.csv
+
+# Re-fetch discussion comments only (non-fatal; report renders without them if this fails)
+powershell -File 9-Get-WorkItemComments.ps1 -CsvDir csv
 ```
 
 ## Pipeline Architecture
 
-The batch runs scripts in this order: **1 → 2 → 3 → 8 → 6 → 7**. Script 8 was added after 6 and 7 were already numbered; its output (`csv\pbi_bug_links.csv`) is consumed by script 7.
+The batch runs scripts in this order: **1 → 2 → 3 → 8 → 9 → 6 → 7**. Scripts 8 and 9 were added after 6 and 7 were already numbered; their outputs are consumed by script 7.
 
 | Step | Script | Network | Produces |
 |---|---|---|---|
 | 1 | `1-Get-TestPlanResults.ps1` | yes | `csv\test_plan_results.csv` |
 | 2 | `2-Get-AdoQueryResults.ps1` | yes | `csv\pbi_task_links.csv` |
 | 3 | `3-Get-TaskTestsLinkResults.ps1` | yes | `csv\task_tests_link_results.csv` |
-| 4 | `8-Get-PbiBugLinks.ps1` | yes | `csv\pbi_bug_links.csv` |
-| 5 | `6-Build-WeeklyReports.ps1` | **no** | 4 derived CSVs |
-| 6 | `7-Build-MeetingReport.ps1` | **no** | `weekly_meeting_report.html` |
+| 4 | `8-Get-PbiBugLinks.ps1` | yes | `csv\pbi_bug_links.csv` + `csv\task_bug_links.csv` |
+| 5 | `9-Get-WorkItemComments.ps1` | yes | `csv\workitem_comments.csv` |
+| 6 | `6-Build-WeeklyReports.ps1` | **no** | 4 derived CSVs |
+| 7 | `7-Build-MeetingReport.ps1` | **no** | `weekly_meeting_report.html` |
 
-**Raw extracts** (`csv\test_plan_results.csv`, `pbi_task_links.csv`, `task_tests_link_results.csv`, `pbi_bug_links.csv`) are committed to git — they are point-in-time ADO snapshots that cannot be recovered. The derived CSVs and the HTML report are `.gitignore`d because they are recomputable.
+**Raw extracts** — committed to git because they are point-in-time ADO snapshots that cannot be recovered once ADO moves on:
+- `csv\test_plan_results.csv`
+- `csv\pbi_task_links.csv`
+- `csv\task_tests_link_results.csv`
+- `csv\pbi_bug_links.csv`
+- `csv\task_bug_links.csv`
+- `csv\workitem_comments.csv`
 
-Scripts 1–4 share one auth mechanism: PAT lookup order is `-Pat` arg → DPAPI cache at `%LOCALAPPDATA%\AdoTestPlanExtractor\pat.dat` → `$env:AZURE_DEVOPS_PAT` → prompt. **Press Enter at the prompt to use Windows auth** (the normal path for the on-prem server). Clear a stale PAT with `-ResetPat`.
+The derived CSVs and `weekly_meeting_report.html` are `.gitignore`d — regenerate rather than trusting a stale copy.
+
+Scripts 1, 2, 3, 8, and 9 share one auth mechanism: PAT lookup order is `-Pat` arg → DPAPI cache at `%LOCALAPPDATA%\AdoTestPlanExtractor\pat.dat` → `$env:AZURE_DEVOPS_PAT` → prompt. **Press Enter at the prompt to use Windows auth** (the normal path for the on-prem server). Clear a stale PAT with `-ResetPat`.
+
+**Script 9 is non-fatal.** If it fails, `Run-AdoExtracts.bat` warns and continues — the report renders without discussion icons rather than stopping the pipeline.
 
 ## GitHub Actions Automation
 
-`.github/workflows/weekly-perf-report.yml` runs the pipeline on a cron schedule (01:07 UTC every Tuesday = 9:07 AM Philippine Time) and emails `weekly_meeting_report.html` to the team.
+`.github/workflows/weekly-perf-report.yml` runs the pipeline on a cron schedule (`7 0 * * 2` = **00:07 UTC every Tuesday = 8:07 AM Philippine Time**) and emails `weekly_meeting_report.html` to the team. It also fires on every push to `main` and supports `workflow_dispatch` for manual runs.
 
 **Required**: a self-hosted Windows runner with network access to `tfs.deltek.com`, labeled `perf-report`. GitHub-hosted runners cannot reach the on-prem server.
 
 **Secrets needed**: `AZURE_DEVOPS_PAT` (TFS: Test Management Read + Work Items Read) and `SMTP_PASSWORD` (for `smtp.deltek.com`). The workflow can be triggered manually with `workflow_dispatch`.
 
+## `7-Build-MeetingReport.ps1` Internals
+
+This is the most complex script — it generates a self-contained HTML/JS dashboard inside a PowerShell heredoc. Key architecture points for anyone modifying it:
+
+**Data flow (PowerShell side):**
+- Reads 6 CSVs into data structures
+- Builds `$tasks` array (one object per active task) with derived fields
+- Bug data: `$bugsByPbi` (PBI ID → HashSet of Bug IDs) from `pbi_bug_links.csv`; `$bugsByTask` (Task ID → HashSet of Bug IDs) from `task_bug_links.csv`. Each task's `bugIds` field merges both sources, deduplicated.
+- Discussion data: `$commentsByItem` (work item ID → latest comment) from `workitem_comments.csv`. Each task gets `taskDisc` and `pbiDisc` objects, plus `discDays` (days since latest comment).
+- Serializes everything to JSON, embeds in `<script id="payload" type="application/json">` in the HTML
+
+**Data flow (JavaScript side):**
+- Reads `META` from the JSON payload; `var GL = META.glyphs || {}` provides all non-ASCII glyphs
+- Task Details `COLS` array drives column headers and filter cells — but `renderTasks` renders data cells **manually** with explicit `tr.appendChild()` calls. Removing a key from `COLS` removes the header/filter but not the data cell; both must be updated together.
+- `ACTIVITY` object holds filter functions: `w7` and `w14` check both `t.changedDays` (state change) AND `t.discDays` (latest comment), so a task with a recent comment appears even if its state hasn't changed.
+
+**Non-ASCII characters** must use the `GL` glyph object — never paste symbols directly into the heredoc. PowerShell 5.1 reads BOM-less scripts as Windows-1252; a literal `✓` becomes mojibake. The pattern: add `[string][char]0xXXXX` to `$glyphs` in PowerShell, reference as `GL.keyname` in JavaScript. `ConvertTo-Json` escapes `[char]` values to `\uXXXX` in the JSON payload.
+
+**The `discOverlay` div must appear before the `<script>` tag.** The IIFE runs immediately when parsed; `document.getElementById("discClose")` returns null for elements declared after `</script>`.
+
 ## PowerShell Conventions
 
 These traps have already bitten this code — don't undo the fixes:
 
-- **`$PSScriptRoot` is empty inside `param()` defaults** under `powershell.exe -File`. Scripts 6, 7, and 8 declare bare params and resolve path defaults in the body using `$PSScriptRoot` after the scope is established.
+- **`$PSScriptRoot` is empty inside `param()` defaults** under `powershell.exe -File`. Scripts 6, 7, 8, and 9 declare bare params and resolve path defaults in the body.
 - **`-ExtraFields` must be one comma-separated string, not multiple tokens.** Across the `cmd.exe → powershell.exe` boundary a multi-token list overflows positionally into `-Pat`/`-ApiVersion`. `Run-AdoExtracts.bat` passes one quoted string; scripts 2 and 3 split it themselves.
 - **`Microsoft.VSTS.Common.ActivatedDate` does not exist on this org.** Use `Microsoft.VSTS.Common.StateChangeDate` instead. Do not add `ActivatedDate` back.
 - **Script 7 is pure ASCII.** Glyphs are built from `[char]` codes shipped through JSON (`\uXXXX`). PowerShell 5.1 reads BOM-less scripts as Windows-1252, so a literal non-ASCII character in the source becomes mojibake in the output. Don't paste symbols directly into it.
-- **Variable name shadowing is silent.** PowerShell variable names are case-insensitive: a loop-local `$neverRun` silently overwrites a constant `$NeverRun`. Script 6 names its outcome constant `$OutcomeNeverRun` to avoid this.
+- **Variable name shadowing is silent.** PowerShell variable names are case-insensitive: a loop-local `$neverRun` silently overwrites a constant `$NeverRun`. Script 6 names its outcome constant `$OutcomeNeverRun` to avoid this; script 7's `bugIds` subexpression uses `$bugSet` (distinct from outer variables) for the same reason.
 - **Never accumulate rows with `+=` in a loop.** With thousands of test points and hundreds of links this is quadratic. Script 6 uses hashtables of `List[object]`.
 - **API version probing.** The on-prem server does not support `api-version=7.1`. All network scripts probe downward (7.1 → 7.0 → 6.0 → 5.1 → …) when `-ApiVersion` is not passed. An empty-but-successful response usually means a version mismatch, not absent data.
+- **`pbi_bug_links.csv` contains only PBI-level Related links; `task_bug_links.csv` contains only Task-level Related links.** Both are written by `8-Get-PbiBugLinks.ps1`. Bug links that hang directly off a Task (not a PBI) appear only in `task_bug_links.csv` — checking only `pbi_bug_links.csv` for a task's bugs will return zero even when bugs exist.

@@ -254,6 +254,25 @@ try {
         Write-Warning "workitem_comments.csv not found - discussion icons will be absent. Run 9-Get-WorkItemComments.ps1."
     }
 
+    # --- Remaining Work change history from 10-Get-WorkItemRemainingWork.ps1.
+    # --- Optional: if the CSV is absent the report renders without RW data.
+    # --- Only the most-recent change per task is kept (CSV is oldest-first,
+    # --- so each write overwrites the previous, leaving the last entry).
+    $remWorkByTask = @{}
+    $remWorkPath = Join-Path $CsvDir 'workitem_remwork_history.csv'
+    if (Test-Path -LiteralPath $remWorkPath) {
+        foreach ($r in (Import-Csv -LiteralPath $remWorkPath)) {
+            if ($r.WorkItemId) {
+                $remWorkByTask[$r.WorkItemId] = @{
+                    old  = $r.OldValue
+                    new  = $r.NewValue
+                    date = $r.RevisionDate
+                }
+            }
+        }
+        Write-Host ("Remaining Work history loaded: {0} task(s) with changes" -f $remWorkByTask.Count)
+    }
+
     # --- Activity dates. These live on the work item itself, so they come from
     # --- the link extracts rather than the connected dataset (script 6 doesn't
     # --- carry them). StateChangeDate and ClosedDate are 100% / correctly
@@ -262,20 +281,38 @@ try {
     $taskDates = @{}
     foreach ($link in $pbiTaskRows) {
         $taskDates[$link.'Target ID'] = @{
-            changed = $link.'Target Microsoft.VSTS.Common.StateChangeDate'
+            changed = $link.'Target System.ChangedDate'
             closed  = $link.'Target Microsoft.VSTS.Common.ClosedDate'
         }
     }
     # Fallback for tasks with no PBI parent, which never appear above.
+    # Also builds $tcStatesByTask: per scripting task, how many linked test
+    # cases are in "Ready" state (scripted) vs "Design" (still being authored).
     $taskTestsPath = Join-Path $CsvDir 'task_tests_link_results.csv'
+    $tcStatesByTask = @{}
     if (Test-Path -LiteralPath $taskTestsPath) {
         foreach ($link in (Import-Csv -LiteralPath $taskTestsPath)) {
             if ($link.'Link Type' -eq '(root)') { continue }
             $id = $link.'Source ID'
-            if ($taskDates.ContainsKey($id)) { continue }
-            $taskDates[$id] = @{
-                changed = $link.'Source Microsoft.VSTS.Common.StateChangeDate'
-                closed  = $link.'Source Microsoft.VSTS.Common.ClosedDate'
+            if (-not $taskDates.ContainsKey($id)) {
+                $taskDates[$id] = @{
+                    changed = $link.'Source System.ChangedDate'
+                    closed  = $link.'Source Microsoft.VSTS.Common.ClosedDate'
+                }
+            }
+            $tid = $link.'Target ID'
+            if (-not $id -or -not $tid) { continue }
+            if (-not $tcStatesByTask.ContainsKey($id)) {
+                $tcStatesByTask[$id] = @{
+                    Seen   = [System.Collections.Generic.HashSet[string]]::new()
+                    Ready  = 0
+                    Design = 0
+                }
+            }
+            $bucket = $tcStatesByTask[$id]
+            if ($bucket.Seen.Add($tid)) {
+                if ($link.'Target System.State' -eq 'Ready')       { $bucket.Ready++ }
+                elseif ($link.'Target System.State' -eq 'Design')  { $bucket.Design++ }
             }
         }
     }
@@ -429,6 +466,8 @@ try {
                 else { [int]($e - $s) }
             )
             cases    = $t.CaseSet.Count
+            tcReady  = if ($tcStatesByTask.ContainsKey($t.id)) { $tcStatesByTask[$t.id].Ready }  else { 0 }
+            tcDesign = if ($tcStatesByTask.ContainsKey($t.id)) { $tcStatesByTask[$t.id].Design } else { 0 }
             testers  = ((@($t.TesterSet) | Sort-Object) -join ', ')
             exec     = $t.exec
             passed   = $t.passed
@@ -437,7 +476,9 @@ try {
             na       = $t.na
             never    = $t.never
             mistakes = $t.mistakes
-            remWork  = [double]$t.remWork
+            remWork    = [double]$t.remWork
+            remWorkOld = if ($remWorkByTask.ContainsKey($t.id)) { $remWorkByTask[$t.id].old }  else { $null }
+            remWorkNew = if ($remWorkByTask.ContainsKey($t.id)) { $remWorkByTask[$t.id].new }  else { $null }
             discDays = $(
                 $discList = $commentsByItem[$t.id]
                 if ($discList -and $discList.Count) { Get-DaysSince $discList[$discList.Count - 1].date } else { -1 }
@@ -472,6 +513,7 @@ try {
         dot     = [string][char]0x00B7   # middot separator
         times   = [string][char]0x00D7   # multiplication sign (dismiss button)
         up      = [string][char]0x2191
+        arrow   = [string][char]0x2192   # right arrow (A -> B)
         down    = [string][char]0x2193
     }
 
@@ -592,6 +634,14 @@ try {
   h2 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
   .sub { color: var(--ink-2); font-size: 12.5px; margin: 0; }
   .muted { color: var(--ink-muted); }
+  .scripting-status { text-align: center; vertical-align: middle; }
+  .rw-history { font-size: 11.5px; margin-top: 4px; color: var(--ink-2); }
+  .rw-label   { color: var(--ink-muted); }
+  .rw-val     { font-weight: 500; }
+  .rw-none    { color: var(--ink-muted); font-style: italic; }
+  .tc-ready  { color: var(--st-good); font-weight: 500; }
+  .tc-design { color: var(--ink-muted); }
+  .tc-sep    { margin: 0 0.5em; color: var(--ink-muted); }
 
   header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 30px; }
   header > div { flex: 1; min-width: 0; }
@@ -783,14 +833,14 @@ try {
   .cap-section { display: flex; flex-direction: column; gap: 4px; }
   .cap-row  { display: grid; grid-template-columns: 152px 1fr 200px; gap: 12px; align-items: center; padding: 6px 4px; border-radius: 6px; }
   .cap-info  { font-size: 12px; font-variant-numeric: tabular-nums; }
-  .cap-rate  { font-weight: 600; display: block; }
+  .cap-rate  { font-weight: 600; }
   .cap-rate.ok   { color: var(--st-good); }
   .cap-rate.warn { color: #fab219; }
   .cap-rate.over { color: var(--st-critical); }
   .cap-detail { color: var(--ink-muted); font-size: 11px; }
   .cap-empty  { color: var(--ink-muted); font-style: italic; font-size: 13px; }
   .cap-scale  { display: flex; justify-content: space-between; padding-left: 164px; margin-top: 8px; font-size: 11px; color: var(--ink-muted); border-top: 1px solid var(--grid); padding-top: 4px; }
-  .cap-col-head { padding-left: 8px; white-space: nowrap; }
+  .cap-col-head { text-align: right; padding-right: 8px; white-space: nowrap; }
   .tasktitle { font-weight: 500; }
   td.nowrap { white-space: nowrap; }
 
@@ -819,6 +869,7 @@ try {
 
   /* Per-column filter row. Sits under the sortable header, inside the same
      sticky-free thead; only the tbody re-renders as you type. */
+  tr.filterrow, .colfoot { display: none; }
   tr.filterrow th { padding: 4px 6px 8px; border-bottom: 1px solid var(--axis); }
   .colf {
     width: 100%; min-width: 0; box-sizing: border-box;
@@ -834,6 +885,7 @@ try {
   th.num .colf { text-align: right; width: 56px; }
   th.ctr .colf { text-align: center; width: 56px; }
   #taskTable th:first-child { min-width: 300px; }
+  #taskTable td { vertical-align: middle; }
   /* Give the meter columns real width. Without this the free space all goes to
      the Task/PBI column and the meter ends up squeezed against the number
      block - centred, but visibly cramped. */
@@ -953,7 +1005,7 @@ try {
   <div class="chart-head">
     <div>
       <h2 id="loadTitle">Assigned Work Items</h2>
-      <p class="sub" id="loadSub">How many tasks each person holds, split by state, and how many PBIs they span.</p>
+      <p class="sub" id="loadSub">A PBI appears only if it has at least one matching task. Bar length = task count; segments show workflow state.</p>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
       <label style="font-size:12px;color:var(--ink-2)">Group by
@@ -964,8 +1016,8 @@ try {
       </label>
       <label style="font-size:12px;color:var(--ink-2)">Colour by
         <select id="fLoadColor" style="min-width:110px">
-          <option value="state" selected>Task state</option>
-          <option value="urgency">Time to target</option>
+          <option value="state">Task state</option>
+          <option value="urgency" selected>Time to target</option>
         </select>
       </label>
       <button id="loadTableBtn" type="button" aria-pressed="false">Table view</button>
@@ -978,8 +1030,7 @@ try {
 
 <div class="card">
   <h2>Task Details</h2>
-  <p class="sub" style="margin-bottom:12px">Outcome columns cover test-plan-sourced points, so they total to the tiles above.
-     Scripting tasks show <span class="muted">-</span> because they author test cases rather than execute a plan.</p>
+  <p class="sub" style="margin-bottom:12px">One row per active task, scoped by the filters above. Scripting tasks show ADO test case state (Ready / Design); Execution tasks show test plan outcomes.</p>
   <div id="taskTable"></div>
 </div>
 
@@ -1152,7 +1203,7 @@ try {
                 kind: new Set(), text: "", activity: new Set(["w7"]),
                 activityRange: { start: "", end: "" },
                 group: "assignee", tableView: false, sortKey: "exec", sortDir: -1,
-                loadGroup: "assignee", loadColor: "state", loadTableView: false,
+                loadGroup: "assignee", loadColor: "urgency", loadTableView: false,
                 selectedPbiKey: null, colFilters: {} };
 
   // changedDays / closedDays are -1 when the date is absent, so a plain
@@ -1756,9 +1807,9 @@ try {
       if (hasAnyCap) {
         if (g.capRate > 0) {
           var cls = g.capRate > 7 ? "over" : g.capRate > 4 ? "warn" : "ok";
-          sr.appendChild(el("td", "cap-rate " + cls, g.capRate.toFixed(1) + " h/day"));
+          sr.appendChild(el("td", "num cap-rate " + cls, g.capRate.toFixed(1) + " h/day"));
         } else {
-          sr.appendChild(el("td", "muted", GL.mdash));
+          sr.appendChild(el("td", "num muted", GL.mdash));
         }
       }
       loadDims().forEach(function (d) { sr.appendChild(el("td", "num", fmt(g[d.field]))); });
@@ -1795,9 +1846,9 @@ try {
           var isDone = p["Done"] === p.tasks;
           if (!isDone && p.capRate > 0) {
             var pcls = p.capRate > 7 ? "over" : p.capRate > 4 ? "warn" : "ok";
-            tr.appendChild(el("td", "cap-rate " + pcls, p.capRate.toFixed(1)));
+            tr.appendChild(el("td", "num cap-rate " + pcls, p.capRate.toFixed(1)));
           } else {
-            tr.appendChild(el("td", "muted", GL.mdash));
+            tr.appendChild(el("td", "num muted", GL.mdash));
           }
         }
         // Real per-PBI counts. A zero is dimmed rather than dashed - a dash
@@ -2076,13 +2127,37 @@ try {
 
       // A Scripting task links test cases, not a plan - it has no execution
       // outcomes of its own, and a 0 would read as "all failed to run".
-      // Both branches must emit exactly 6 cells to match the 6 trailing
-      // columns (Points..Not started). A mismatch silently shifts every
-      // column after it, which looks like bad data rather than a layout bug.
+      // For Scripting-kind tasks we show test case ADO state (Ready/Design)
+      // instead: a colspan=6 cell spanning the outcome columns. For Other-
+      // kind tasks with exec=0, we still show six dashes.
+      // NOTE: colspan=6 means this branch emits ONE cell spanning 6 columns,
+      // not 6 cells - the total column count is still correct.
       if (task.exec === 0) {
-        ["points", "passed", "failed", "blocked", "na", "never"].forEach(function () {
-          tr.appendChild(el("td", "num muted", GL.mdash));
-        });
+        if (task.kind === "Scripting" && task.state !== "Done" && (task.tcReady + task.tcDesign) > 0) {
+          var sc = el("td", "scripting-status");
+          sc.colSpan = 6;
+          var parts = [
+            '<span class="tc-ready">'  + fmt(task.tcReady)  + " Ready</span>",
+            '<span class="tc-design">' + fmt(task.tcDesign) + " Design</span>"
+          ];
+          var rwLine = '<div class="rw-history"><span class="rw-label">Rem. Work: </span>';
+          if (task.remWorkOld !== null && task.remWorkNew !== null) {
+            var oldStr = task.remWorkOld !== "" ? task.remWorkOld + "h" : GL.mdash;
+            var newStr = task.remWorkNew !== "" ? task.remWorkNew + "h" : GL.mdash;
+            rwLine += '<span class="rw-val">' + oldStr + "</span>"
+                    + " " + GL.arrow + " "
+                    + '<span class="rw-val">' + newStr + "</span>";
+          } else {
+            rwLine += '<span class="rw-none">no changes</span>';
+          }
+          rwLine += "</div>";
+          sc.innerHTML = parts.join('<span class="tc-sep">' + GL.dot + "</span>") + rwLine;
+          tr.appendChild(sc);
+        } else {
+          ["points", "passed", "failed", "blocked", "na", "never"].forEach(function () {
+            tr.appendChild(el("td", "num muted", GL.mdash));
+          });
+        }
       } else {
         tr.appendChild(el("td", "num", fmt(task.exec)));
         tr.appendChild(el("td", "num", fmt(task.passed)));
@@ -2111,8 +2186,8 @@ try {
     // restating it here just made the heading jitter when the toggle changed.
     $("loadTitle").textContent = "Assigned Work Items";
     $("loadSub").textContent = state.loadColor === "urgency"
-      ? "Bar length is task count; segments are time remaining until the target date. Calendar days, not effort."
-      : "Bar length is task count; segments are workflow state. Switch Colour by to see time remaining.";
+      ? "A PBI appears only if it has at least one matching task. Bar length = task count; segments show calendar days remaining to the PBI target date (not effort)."
+      : "A PBI appears only if it has at least one matching task. Bar length = task count; segments show workflow state.";
     $("loadWrap").classList.toggle("hidden", state.loadTableView);
     $("loadTable").classList.toggle("hidden", !state.loadTableView);
     $("loadTableBtn").setAttribute("aria-pressed", state.loadTableView ? "true" : "false");

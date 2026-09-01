@@ -49,15 +49,17 @@ missing or half-written data.
 | 2 | `2-Get-AdoQueryResults.ps1` | yes | `csv\pbi_task_links.csv` |
 | 3 | `3-Get-TaskTestsLinkResults.ps1` | yes | `csv\task_tests_link_results.csv` |
 | 4 | `8-Get-PbiBugLinks.ps1` | yes | `csv\pbi_bug_links.csv` + `csv\task_bug_links.csv` |
-| 5 | `6-Build-WeeklyReports.ps1` | **no** | 4 derived CSVs (below) |
-| 6 | `7-Build-MeetingReport.ps1` | **no** | `weekly_meeting_report.html` |
+| 5 | `9-Get-WorkItemComments.ps1` | yes | `csv\workitem_comments.csv` |
+| 6 | `6-Build-WeeklyReports.ps1` | **no** | 4 derived CSVs (below) |
+| 7 | `7-Build-MeetingReport.ps1` | **no** | `weekly_meeting_report.html` |
 
-Steps 1–4 are the **extraction** — they talk to ADO and may prompt for credentials.
-Steps 5–6 are **pure local transformation** of what steps 1–4 wrote.
+Steps 1–5 are the **extraction** — they talk to ADO and may prompt for credentials.
+Steps 6–7 are **pure local transformation** of what steps 1–5 wrote.
 
-> The script numbers are not the step order: the batch runs 1, 2, 3, **8**, 6, 7.
-> Script 8 was added after 6 and 7 were already numbered, and it has to run before
-> them because 7 reads its output.
+> The script numbers are not the step order: the batch runs 1, 2, 3, **8**, **9**, 6, 7.
+> Scripts 8 and 9 were added after 6 and 7 were already numbered, and both must run
+> before them because 7 reads their output. Step 5 (script 9) is non-fatal — if it
+> fails, the pipeline continues and the report renders without discussion icons.
 
 ### What each step does
 
@@ -100,6 +102,7 @@ csv\pbi_task_links.csv
 csv\task_tests_link_results.csv
 csv\pbi_bug_links.csv
 csv\task_bug_links.csv
+csv\workitem_comments.csv
 ```
 
 **Derived reports** — fully recomputable from the above, so they are *not* committed.
@@ -171,7 +174,8 @@ Common to the network scripts (1, 2, 3, 8): `-Organization`, `-Project`, `-Pat`,
 | `1-Get-TestPlanResults` | `-Plan` (default `2535838`), `-RootSuite`, `-Detailed` | `test_plan_results.csv` |
 | `2-Get-AdoQueryResults` | `-QueryUrl` (prompts if omitted), `-ExtraFields` | `query_results.csv` |
 | `3-Get-TaskTestsLinkResults` | `-QueryUrl` (hardcoded default), `-ExtraFields` | `task_tests_link_results.csv` |
-| `8-Get-PbiBugLinks` | `-CsvDir` | `csv\pbi_bug_links.csv` |
+| `8-Get-PbiBugLinks` | `-CsvDir` | `csv\pbi_bug_links.csv` + `csv\task_bug_links.csv` |
+| `9-Get-WorkItemComments` | `-CsvDir` | `csv\workitem_comments.csv` |
 | `6-Build-WeeklyReports` | `-CsvDir`, `-PassThru` | 4 CSVs into `csv\` |
 | `7-Build-MeetingReport` | `-CsvDir`, `-OutputPath`, `-Show` | `weekly_meeting_report.html` |
 
