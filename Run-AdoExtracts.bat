@@ -114,7 +114,7 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo [5/8] Latest discussion entries
+echo [5/9] Latest discussion entries
 echo ========================================
 rem Fetches the most-recent discussion comment for every PBI and Task so the
 rem HTML report can show it on demand. Optional: if this step fails the rest
@@ -122,7 +122,7 @@ rem of the pipeline still completes - discussion icons will simply not appear.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%9-Get-WorkItemComments.ps1" -CsvDir "%OUTDIR%"
 if errorlevel 1 (
     echo.
-    echo [5/8] WARNING: discussion fetch failed - continuing without it.
+    echo [5/9] WARNING: discussion fetch failed - continuing without it.
     echo       Discussion icons will not appear in the HTML report.
     echo       Re-run manually with:
     echo         powershell -File "%SCRIPT_DIR%9-Get-WorkItemComments.ps1"
@@ -130,7 +130,7 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo [6/8] Remaining Work change history
+echo [6/9] Remaining Work change history
 echo ========================================
 rem Fetches the Remaining Work revision history for every Task so the HTML
 rem report can show scripting task progress as "Xh to Yh". Optional: if this
@@ -139,7 +139,7 @@ rem without the Remaining Work change info.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%10-Get-WorkItemRemainingWork.ps1" -CsvDir "%OUTDIR%"
 if errorlevel 1 (
     echo.
-    echo [6/8] WARNING: remaining work history fetch failed - continuing without it.
+    echo [6/9] WARNING: remaining work history fetch failed - continuing without it.
     echo       Remaining Work change data will not appear in the HTML report.
     echo       Re-run manually with:
     echo         powershell -File "%SCRIPT_DIR%10-Get-WorkItemRemainingWork.ps1"
@@ -147,12 +147,29 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo [7/8] Build derived weekly reports
+echo [7/9] Test Case state history
+echo ========================================
+rem Fetches the System.State revision history for every Test Case linked to a
+rem scripting task so the HTML report can show how many transitioned to Ready
+rem or Design state. Optional: if this step fails the rest of the pipeline
+rem still completes - state change data will simply not appear.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%11-Get-TestCaseStateHistory.ps1" -CsvDir "%OUTDIR%"
+if errorlevel 1 (
+    echo.
+    echo [7/9] WARNING: TC state history fetch failed - continuing without it.
+    echo       State change data will not appear in the HTML report.
+    echo       Re-run manually with:
+    echo         powershell -File "%SCRIPT_DIR%11-Get-TestCaseStateHistory.ps1"
+)
+
+echo.
+echo ========================================
+echo [8/9] Build derived weekly reports
 echo ========================================
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%6-Build-WeeklyReports.ps1" -CsvDir "%OUTDIR%"
 if errorlevel 1 (
     echo.
-    echo [7/8] FAILED. The raw extracts above are still good - you can
+    echo [8/9] FAILED. The raw extracts above are still good - you can
     echo       re-run just this step with:
     echo         powershell -File "%SCRIPT_DIR%6-Build-WeeklyReports.ps1"
     goto :end
@@ -160,12 +177,12 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo [8/8] Build HTML meeting report
+echo [9/9] Build HTML meeting report
 echo ========================================
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%7-Build-MeetingReport.ps1" -CsvDir "%OUTDIR%"
 if errorlevel 1 (
     echo.
-    echo [8/8] FAILED. The CSVs above are still good - you can
+    echo [9/9] FAILED. The CSVs above are still good - you can
     echo       re-run just this step with:
     echo         powershell -File "%SCRIPT_DIR%7-Build-MeetingReport.ps1"
     goto :end
@@ -173,7 +190,7 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo All done: extracts + bug links + discussion + rem. work history + weekly CSVs + HTML report.
+echo All done: extracts + bug links + discussion + rem. work history + TC state history + weekly CSVs + HTML report.
 echo   CSVs        : %OUTDIR%
 echo   HTML report : %SCRIPT_DIR%weekly_meeting_report.html
 echo ========================================

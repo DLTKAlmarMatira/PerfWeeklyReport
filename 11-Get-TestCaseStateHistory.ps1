@@ -1,32 +1,34 @@
 <#
 .SYNOPSIS
-    Fetches Remaining Work change history for every Task in the pipeline.
+    Fetches System.State change history for every Test Case linked to a scripting task.
 
 .DESCRIPTION
-    Walks the work item updates API for each Task and records any revision
-    where Microsoft.VSTS.Scheduling.RemainingWork changed value (old -> new).
-    The HTML report uses the most-recent change per task to show scripting
-    task progress as "Xh -> Yh" or "no changes".
+    Walks the work item updates API for each Test Case found in
+    task_tests_link_results.csv and records any revision where System.State
+    changed value (old -> new).
+    The HTML report uses the most-recent change per test case to show, per
+    scripting task, how many of its linked test cases transitioned to Ready or
+    Design state.
 
     Unreadable items are silently skipped rather than hard-failing the pipeline.
 
 .PARAMETER CsvDir
-    Folder holding pbi_task_links.csv and receiving the output.
+    Folder holding task_tests_link_results.csv and receiving the output.
     Default: the "csv" folder next to this script.
 
 .PARAMETER OutputPath
-    Default: <CsvDir>\workitem_remwork_history.csv
+    Default: <CsvDir>\workitem_tc_state_history.csv
 
 .PARAMETER Pat
     Personal Access Token. If omitted: the shared encrypted cache, then
     $env:AZURE_DEVOPS_PAT, then a prompt (Enter = Windows auth).
 
 .EXAMPLE
-    .\10-Get-WorkItemRemainingWork.ps1
+    .\11-Get-TestCaseStateHistory.ps1
 
 .NOTES
     Read-only. Writes nothing to ADO.
-    Requires step 2 (2-Get-AdoQueryResults.ps1) to have run first.
+    Requires step 3 (3-Get-TaskTestsLinkResults.ps1) to have run first.
 #>
 
 [CmdletBinding()]
@@ -45,7 +47,7 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir = $PSScriptRoot
 if (-not $ScriptDir)  { $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition }
 if (-not $CsvDir)     { $CsvDir = Join-Path $ScriptDir 'csv' }
-if (-not $OutputPath) { $OutputPath = Join-Path $CsvDir 'workitem_remwork_history.csv' }
+if (-not $OutputPath) { $OutputPath = Join-Path $CsvDir 'workitem_tc_state_history.csv' }
 
 $BaseUrl = $Organization.TrimEnd('/')
 $CredentialFile = Join-Path $env:LOCALAPPDATA 'AdoTestPlanExtractor\pat.dat'
@@ -76,24 +78,24 @@ function Invoke-Ado {
 }
 
 try {
-    $pbiTaskPath = Join-Path $CsvDir 'pbi_task_links.csv'
-    if (-not (Test-Path -LiteralPath $pbiTaskPath)) {
-        throw "Not found: $pbiTaskPath`nRun Run-AdoExtracts.bat steps 1-3 first."
+    $taskTestsPath = Join-Path $CsvDir 'task_tests_link_results.csv'
+    if (-not (Test-Path -LiteralPath $taskTestsPath)) {
+        throw "Not found: $taskTestsPath`nRun Run-AdoExtracts.bat steps 1-3 first."
     }
 
-    $rows = @(Import-Csv -LiteralPath $pbiTaskPath)
-    $taskIds = @($rows |
-                 Where-Object { $_.'Target System.WorkItemType' -eq 'Task' -and $_.'Target ID' } |
-                 Select-Object -ExpandProperty 'Target ID' | Sort-Object -Unique)
+    $rows = @(Import-Csv -LiteralPath $taskTestsPath)
+    $tcIds = @($rows |
+               Where-Object { $_.'Target System.WorkItemType' -eq 'Test Case' -and $_.'Target ID' } |
+               Select-Object -ExpandProperty 'Target ID' | Sort-Object -Unique)
 
-    if ($taskIds.Count -eq 0) { throw "No Task IDs found in $pbiTaskPath" }
-    Write-Host ("Tasks to check: {0}" -f $taskIds.Count)
+    if ($tcIds.Count -eq 0) { throw "No Test Case IDs found in $taskTestsPath" }
+    Write-Host ("Test cases to check: {0}" -f $tcIds.Count)
 
     # API version probe against the updates endpoint.
     if (-not $ApiVersion) {
         foreach ($v in '7.1','7.0','6.0','5.1','5.0','4.1','3.2','2.0') {
             try {
-                $null = Invoke-Ado -Uri ("$BaseUrl/$Project/_apis/wit/workItems/{0}/updates?`$top=1&api-version=$v" -f $taskIds[0])
+                $null = Invoke-Ado -Uri ("$BaseUrl/$Project/_apis/wit/workItems/{0}/updates?`$top=1&api-version=$v" -f $tcIds[0])
                 $ApiVersion = $v; break
             } catch { }
         }
@@ -104,25 +106,26 @@ try {
     $results = [System.Collections.Generic.List[object]]::new()
     $found = 0; $skipped = 0
 
-    foreach ($id in $taskIds) {
+    foreach ($id in $tcIds) {
         try {
             $resp = Invoke-Ado -Uri "$BaseUrl/$Project/_apis/wit/workItems/$id/updates?api-version=$ApiVersion"
-            $withRw = @($resp.value | Where-Object {
+            $withState = @($resp.value | Where-Object {
                 $_.fields -and
-                $_.fields.'Microsoft.VSTS.Scheduling.RemainingWork'
+                $_.fields.'System.State'
             })
 
-            if ($withRw.Count -eq 0) { $skipped++; continue }
+            if ($withState.Count -eq 0) { $skipped++; continue }
 
             # Emit one row per change, oldest first. Script 7 keeps only the
-            # last row per task (most-recent change) to show in the report.
+            # last row per test case (most-recent change) to show in the report.
             #
             # Use System.ChangedDate.newValue for the date rather than
             # revisedDate. The updates API sets revisedDate to 9999-01-01 for
             # the current live revision (not yet superseded), while
-            # System.ChangedDate.newValue always holds the real timestamp.
-            foreach ($entry in $withRw) {
-                $rw = $entry.fields.'Microsoft.VSTS.Scheduling.RemainingWork'
+            # System.ChangedDate.newValue always holds the real timestamp of
+            # the revision itself. Both fields appear in the same revision entry.
+            foreach ($entry in $withState) {
+                $st = $entry.fields.'System.State'
                 $cd = $entry.fields.'System.ChangedDate'
                 $revDate = if ($cd -and $cd.newValue) {
                     [string]$cd.newValue
@@ -130,23 +133,23 @@ try {
                     [string]$entry.revisedDate
                 } else { '' }
                 $results.Add([pscustomobject][ordered]@{
-                    WorkItemId   = $id
+                    TestCaseId   = $id
                     RevisionDate = $revDate
-                    OldValue     = if ($null -ne $rw.oldValue) { [string]$rw.oldValue } else { '' }
-                    NewValue     = if ($null -ne $rw.newValue) { [string]$rw.newValue } else { '' }
+                    OldState     = if ($null -ne $st.oldValue) { [string]$st.oldValue } else { '' }
+                    NewState     = if ($null -ne $st.newValue) { [string]$st.newValue } else { '' }
                 })
             }
             $found++
         } catch {
-            Write-Warning ("Skipped work item {0}: {1}" -f $id, $_.Exception.Message)
+            Write-Warning ("Skipped test case {0}: {1}" -f $id, $_.Exception.Message)
             $skipped++
         }
     }
 
     Write-Host ''
-    Write-Host ("Tasks with RemainingWork changes: {0}" -f $found)
-    Write-Host ("Total change rows written        : {0}" -f $results.Count)
-    Write-Host ("No changes / skipped             : {0}" -f $skipped)
+    Write-Host ("Test cases with state changes: {0}" -f $found)
+    Write-Host ("Total change rows written     : {0}" -f $results.Count)
+    Write-Host ("No changes / skipped          : {0}" -f $skipped)
 
     $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
     Write-Host ("Wrote {0} ({1} rows)" -f $OutputPath, $results.Count)

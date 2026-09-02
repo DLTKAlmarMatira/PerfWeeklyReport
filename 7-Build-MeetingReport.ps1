@@ -273,6 +273,28 @@ try {
         Write-Host ("Remaining Work history loaded: {0} task(s) with changes" -f $remWorkByTask.Count)
     }
 
+    # --- Test Case state change history from 11-Get-TestCaseStateHistory.ps1.
+    # --- Optional: if the CSV is absent the report renders without TC state
+    # --- change data. All revisions are kept (oldest-first per TC) so the
+    # --- per-task aggregation can replay history to any cutoff date.
+    $tcHistByTc = @{}   # TestCaseId -> List[object] of @{date;old;new}, oldest-first
+    $tcStateHistPath = Join-Path $CsvDir 'workitem_tc_state_history.csv'
+    if (Test-Path -LiteralPath $tcStateHistPath) {
+        foreach ($r in (Import-Csv -LiteralPath $tcStateHistPath)) {
+            if ($r.TestCaseId) {
+                # Treat the 9999-01-01 TFS sentinel as no date — it means the
+                # revision is the current live one and carries no real timestamp.
+                # Get-DaysSince would clamp it to 0, causing false filter hits.
+                $safeDate = if ($r.RevisionDate -notlike '9999*') { $r.RevisionDate } else { '' }
+                if (-not $tcHistByTc.ContainsKey($r.TestCaseId)) {
+                    $tcHistByTc[$r.TestCaseId] = [System.Collections.Generic.List[object]]::new()
+                }
+                $tcHistByTc[$r.TestCaseId].Add(@{ date = $safeDate; old = $r.OldState; new = $r.NewState })
+            }
+        }
+        Write-Host ("TC state history loaded: {0} test case(s) with changes" -f $tcHistByTc.Count)
+    }
+
     # --- Activity dates. These live on the work item itself, so they come from
     # --- the link extracts rather than the connected dataset (script 6 doesn't
     # --- carry them). StateChangeDate and ClosedDate are 100% / correctly
@@ -304,15 +326,18 @@ try {
             if (-not $id -or -not $tid) { continue }
             if (-not $tcStatesByTask.ContainsKey($id)) {
                 $tcStatesByTask[$id] = @{
-                    Seen   = [System.Collections.Generic.HashSet[string]]::new()
-                    Ready  = 0
-                    Design = 0
+                    Seen     = [System.Collections.Generic.HashSet[string]]::new()
+                    Ready    = 0
+                    Design   = 0
+                    TcStates = @{}
                 }
             }
             $bucket = $tcStatesByTask[$id]
             if ($bucket.Seen.Add($tid)) {
-                if ($link.'Target System.State' -eq 'Ready')       { $bucket.Ready++ }
-                elseif ($link.'Target System.State' -eq 'Design')  { $bucket.Design++ }
+                $curState = $link.'Target System.State'
+                $bucket.TcStates[$tid] = $curState
+                if ($curState -eq 'Ready')  { $bucket.Ready++ }
+                elseif ($curState -eq 'Design') { $bucket.Design++ }
             }
         }
     }
@@ -413,10 +438,54 @@ try {
         }
     }
 
+    $cutoff7 = $AsOf.AddDays(-7)
+
     $tasks = foreach ($t in $byTask.Values) {
         $d = $taskDates[$t.id]
         $changedIso = if ($d) { $d.changed } else { '' }
         $closedIso  = if ($d) { $d.closed }  else { '' }
+
+        # Aggregate TC state change history for this task's linked test cases.
+        # Computes how many TCs were in Ready/Design state 7 days ago vs. now
+        # so the display can show "Ready: 28 -> 29 . Design: 6 -> 5".
+        # tcStateChangeDays (-1 sentinel) is used by the activity filter.
+        $tcReady7Ago = 0; $tcDesign7Ago = 0; $tcStateChangeDays = -1
+        if ($tcStatesByTask.ContainsKey($t.id)) {
+            $bucket7 = $tcStatesByTask[$t.id]
+            foreach ($tcId in $bucket7.Seen) {
+                # --- State 7 days ago ---
+                $hist7  = $tcHistByTc[$tcId]
+                $state7 = $null
+                if ($hist7 -and $hist7.Count) {
+                    $stateAtCutoff = $null
+                    $foundBefore   = $false
+                    foreach ($h in $hist7) {           # oldest-first; last match wins
+                        if (-not $h.date) { continue }
+                        $hp = [datetime]::MinValue
+                        if ([datetime]::TryParse($h.date, [ref]$hp) -and $hp -le $cutoff7) {
+                            $stateAtCutoff = $h.new
+                            $foundBefore   = $true
+                        }
+                    }
+                    $state7 = if ($foundBefore) { $stateAtCutoff } else { $hist7[0].old }
+                }
+                if ($null -eq $state7) { $state7 = $bucket7.TcStates[$tcId] }
+
+                if     ($state7 -eq 'Ready')  { $tcReady7Ago++ }
+                elseif ($state7 -eq 'Design') { $tcDesign7Ago++ }
+
+                # --- Most-recent change date for activity filter ---
+                if ($hist7 -and $hist7.Count) {
+                    $lastH = $hist7[$hist7.Count - 1]
+                    if ($lastH.date) {
+                        $dAgo = Get-DaysSince $lastH.date
+                        if ($tcStateChangeDays -lt 0 -or $dAgo -lt $tcStateChangeDays) {
+                            $tcStateChangeDays = $dAgo
+                        }
+                    }
+                }
+            }
+        }
 
         [pscustomobject][ordered]@{
             id       = $t.id
@@ -479,6 +548,9 @@ try {
             remWork    = [double]$t.remWork
             remWorkOld = if ($remWorkByTask.ContainsKey($t.id)) { $remWorkByTask[$t.id].old }  else { $null }
             remWorkNew = if ($remWorkByTask.ContainsKey($t.id)) { $remWorkByTask[$t.id].new }  else { $null }
+            tcReady7Ago       = $tcReady7Ago
+            tcDesign7Ago      = $tcDesign7Ago
+            tcStateChangeDays = $tcStateChangeDays
             discDays = $(
                 $discList = $commentsByItem[$t.id]
                 if ($discList -and $discList.Count) { Get-DaysSince $discList[$discList.Count - 1].date } else { -1 }
@@ -635,7 +707,7 @@ try {
   .sub { color: var(--ink-2); font-size: 12.5px; margin: 0; }
   .muted { color: var(--ink-muted); }
   .scripting-status { text-align: center; vertical-align: middle; }
-  .rw-history { font-size: 11.5px; margin-top: 4px; color: var(--ink-2); }
+  .rw-history, .tc-state-hist { font-size: 11.5px; margin-top: 4px; color: var(--ink-2); }
   .rw-label   { color: var(--ink-muted); }
   .rw-val     { font-weight: 500; }
   .rw-none    { color: var(--ink-muted); font-style: italic; }
@@ -824,7 +896,8 @@ try {
   .disc-section { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
   .disc-who { font-size: 11px; font-weight: 600; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.05em; }
   .disc-meta { font-size: 11.5px; color: var(--ink-muted); margin: 3px 0 8px; }
-  .disc-body { font-size: 13.5px; line-height: 1.65; }
+  .disc-body { font-size: 13.5px; line-height: 1.65; color: var(--ink); font-family: inherit; }
+  .disc-body * { color: inherit !important; background-color: transparent !important; font-family: inherit !important; }
   .disc-body p { margin: 0 0 6px; }
   .disc-body p:last-child { margin-bottom: 0; }
   .disc-none { color: var(--ink-muted); font-style: italic; font-size: 13px; }
@@ -1211,8 +1284,8 @@ try {
   function withinDays(value, limit) { return value >= 0 && value <= limit; }
 
   var ACTIVITY = {
-    w7:  function (t) { return withinDays(t.changedDays, 7)  || withinDays(t.discDays, 7); },
-    w14: function (t) { return withinDays(t.changedDays, 14) || withinDays(t.discDays, 14); },
+    w7:  function (t) { return withinDays(t.changedDays, 7)  || withinDays(t.discDays, 7)  || withinDays(t.tcStateChangeDays, 7);  },
+    w14: function (t) { return withinDays(t.changedDays, 14) || withinDays(t.discDays, 14) || withinDays(t.tcStateChangeDays, 14); },
     c7:  function (t) { return withinDays(t.closedDays, 7); },
     c30: function (t) { return withinDays(t.closedDays, 30); },
     // ISO string comparison works for YYYY-MM-DD dates (lexicographic = chronological).
@@ -2072,10 +2145,6 @@ try {
       var td = el("td");
       td.appendChild(el("div", "tasktitle", task.title));
       var meta = "#" + task.id;
-      // Start rides the meta line rather than taking a 15th column: it is
-      // auto-derived (PBI created date) and lower-value than the target, but
-      // it is what makes the target a window rather than a bare deadline.
-      if (task.startOn) meta += SEP + (META.startLabel || "Start").toLowerCase() + " " + task.startOn;
       if (task.testers) meta += SEP + "tested by " + task.testers;
       td.appendChild(el("div", "meta-line", meta));
       tr.appendChild(td);
@@ -2133,25 +2202,36 @@ try {
       // NOTE: colspan=6 means this branch emits ONE cell spanning 6 columns,
       // not 6 cells - the total column count is still correct.
       if (task.exec === 0) {
-        if (task.kind === "Scripting" && task.state !== "Done" && (task.tcReady + task.tcDesign) > 0) {
+        if (task.kind === "Scripting" && (task.tcReady + task.tcDesign) > 0) {
           var sc = el("td", "scripting-status");
           sc.colSpan = 6;
+          var pct = task.cases > 0 ? Math.round(task.tcReady / task.cases * 100) : 0;
           var parts = [
-            '<span class="tc-ready">'  + fmt(task.tcReady)  + " Ready</span>",
+            '<span class="tc-ready">' + fmt(task.tcReady) + "/" + fmt(task.cases) + " Ready (" + pct + "%)</span>",
             '<span class="tc-design">' + fmt(task.tcDesign) + " Design</span>"
           ];
-          var rwLine = '<div class="rw-history"><span class="rw-label">Rem. Work: </span>';
+          var weekParts = [];
+          var rdyChanged = task.tcReady7Ago  !== task.tcReady;
+          var dsnChanged = task.tcDesign7Ago !== task.tcDesign;
+          if (rdyChanged) weekParts.push(
+            "Ready " + '<span class="tc-ready">'  + fmt(task.tcReady7Ago)  + " " + GL.arrow + " " + fmt(task.tcReady)  + "</span>"
+          );
+          if (dsnChanged) weekParts.push(
+            "Design " + '<span class="tc-design">' + fmt(task.tcDesign7Ago) + " " + GL.arrow + " " + fmt(task.tcDesign) + "</span>"
+          );
           if (task.remWorkOld !== null && task.remWorkNew !== null) {
-            var oldStr = task.remWorkOld !== "" ? task.remWorkOld + "h" : GL.mdash;
-            var newStr = task.remWorkNew !== "" ? task.remWorkNew + "h" : GL.mdash;
-            rwLine += '<span class="rw-val">' + oldStr + "</span>"
-                    + " " + GL.arrow + " "
-                    + '<span class="rw-val">' + newStr + "</span>";
-          } else {
-            rwLine += '<span class="rw-none">no changes</span>';
+            var rwOld = task.remWorkOld !== "" ? task.remWorkOld + "h" : GL.mdash;
+            var rwNew = task.remWorkNew !== "" ? task.remWorkNew + "h" : GL.mdash;
+            weekParts.push("Work " + rwOld + " " + GL.arrow + " " + rwNew);
           }
-          rwLine += "</div>";
-          sc.innerHTML = parts.join('<span class="tc-sep">' + GL.dot + "</span>") + rwLine;
+          var weekLine = '<div class="rw-history"><span class="rw-label">7d: </span>';
+          if (weekParts.length > 0) {
+            weekLine += weekParts.join(' <span class="tc-sep">' + GL.dot + "</span> ");
+          } else {
+            weekLine += '<span class="rw-none">no changes</span>';
+          }
+          weekLine += "</div>";
+          sc.innerHTML = parts.join('<span class="tc-sep">' + GL.dot + "</span>") + weekLine;
           tr.appendChild(sc);
         } else {
           ["points", "passed", "failed", "blocked", "na", "never"].forEach(function () {
@@ -2365,6 +2445,8 @@ try {
           if (byLine.trim()) entry.appendChild(el("div", "disc-meta", byLine));
           var body = el("div", "disc-body");
           body.innerHTML = disc.html;
+          body.querySelectorAll("[style]").forEach(function(n) { n.removeAttribute("style"); });
+          body.querySelectorAll("[color]").forEach(function(n) { n.removeAttribute("color"); });
           entry.appendChild(body);
           sec.appendChild(entry);
         });

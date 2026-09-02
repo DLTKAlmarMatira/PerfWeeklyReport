@@ -34,11 +34,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File 1-Get-TestPlanResults.ps1 -O
 
 # Re-fetch discussion comments only (non-fatal; report renders without them if this fails)
 powershell -File 9-Get-WorkItemComments.ps1 -CsvDir csv
+
+# Re-fetch Remaining Work revision history only (non-fatal; report renders without it if this fails)
+powershell -File 10-Get-WorkItemRemainingWork.ps1 -CsvDir csv
+
+# Re-fetch Test Case state change history only (non-fatal; report renders without it if this fails)
+powershell -File 11-Get-TestCaseStateHistory.ps1 -CsvDir csv
 ```
 
 ## Pipeline Architecture
 
-The batch runs scripts in this order: **1 → 2 → 3 → 8 → 9 → 6 → 7**. Scripts 8 and 9 were added after 6 and 7 were already numbered; their outputs are consumed by script 7.
+The batch runs scripts in this order: **1 → 2 → 3 → 8 → 9 → 10 → 11 → 6 → 7**. Scripts 8, 9, 10, and 11 were added after 6 and 7 were already numbered; their outputs are consumed by script 7.
 
 | Step | Script | Network | Produces |
 |---|---|---|---|
@@ -47,8 +53,10 @@ The batch runs scripts in this order: **1 → 2 → 3 → 8 → 9 → 6 → 7**.
 | 3 | `3-Get-TaskTestsLinkResults.ps1` | yes | `csv\task_tests_link_results.csv` |
 | 4 | `8-Get-PbiBugLinks.ps1` | yes | `csv\pbi_bug_links.csv` + `csv\task_bug_links.csv` |
 | 5 | `9-Get-WorkItemComments.ps1` | yes | `csv\workitem_comments.csv` |
-| 6 | `6-Build-WeeklyReports.ps1` | **no** | 4 derived CSVs |
-| 7 | `7-Build-MeetingReport.ps1` | **no** | `weekly_meeting_report.html` |
+| 6 | `10-Get-WorkItemRemainingWork.ps1` | yes | `csv\workitem_remwork_history.csv` |
+| 7 | `11-Get-TestCaseStateHistory.ps1` | yes | `csv\workitem_tc_state_history.csv` |
+| 8 | `6-Build-WeeklyReports.ps1` | **no** | 4 derived CSVs |
+| 9 | `7-Build-MeetingReport.ps1` | **no** | `weekly_meeting_report.html` |
 
 **Raw extracts** — committed to git because they are point-in-time ADO snapshots that cannot be recovered once ADO moves on:
 - `csv\test_plan_results.csv`
@@ -57,6 +65,8 @@ The batch runs scripts in this order: **1 → 2 → 3 → 8 → 9 → 6 → 7**.
 - `csv\pbi_bug_links.csv`
 - `csv\task_bug_links.csv`
 - `csv\workitem_comments.csv`
+- `csv\workitem_remwork_history.csv`
+- `csv\workitem_tc_state_history.csv`
 
 The derived CSVs and `weekly_meeting_report.html` are `.gitignore`d — regenerate rather than trusting a stale copy.
 
@@ -77,10 +87,12 @@ Scripts 1, 2, 3, 8, and 9 share one auth mechanism: PAT lookup order is `-Pat` a
 This is the most complex script — it generates a self-contained HTML/JS dashboard inside a PowerShell heredoc. Key architecture points for anyone modifying it:
 
 **Data flow (PowerShell side):**
-- Reads 6 CSVs into data structures
+- Reads 7 CSVs into data structures
 - Builds `$tasks` array (one object per active task) with derived fields
 - Bug data: `$bugsByPbi` (PBI ID → HashSet of Bug IDs) from `pbi_bug_links.csv`; `$bugsByTask` (Task ID → HashSet of Bug IDs) from `task_bug_links.csv`. Each task's `bugIds` field merges both sources, deduplicated.
 - Discussion data: `$commentsByItem` (work item ID → latest comment) from `workitem_comments.csv`. Each task gets `taskDisc` and `pbiDisc` objects, plus `discDays` (days since latest comment).
+- Remaining Work history: `$remWorkByTask` (Task ID → latest old→new revision) from `workitem_remwork_history.csv`. Used to show scripting task progress as "Xh → Yh". Missing file is non-fatal.
+- TC state history: `$tcStateHistByTc` (Test Case ID → latest old→new state change) from `workitem_tc_state_history.csv`. Per-task aggregation produces `tcToReady`, `tcToDesign`, and `tcStateChangeDays` fields in the JSON payload. Missing file is non-fatal. `tcStateChangeDays` uses -1 as sentinel (consistent with `discDays`) and feeds the `w7`/`w14` activity filters via the existing `withinDays()` guard.
 - Serializes everything to JSON, embeds in `<script id="payload" type="application/json">` in the HTML
 
 **Data flow (JavaScript side):**
