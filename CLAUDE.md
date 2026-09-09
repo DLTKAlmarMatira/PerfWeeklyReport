@@ -70,9 +70,9 @@ The batch runs scripts in this order: **1 → 2 → 3 → 8 → 9 → 10 → 11 
 
 The derived CSVs and `weekly_meeting_report.html` are `.gitignore`d — regenerate rather than trusting a stale copy.
 
-Scripts 1, 2, 3, 8, and 9 share one auth mechanism: PAT lookup order is `-Pat` arg → DPAPI cache at `%LOCALAPPDATA%\AdoTestPlanExtractor\pat.dat` → `$env:AZURE_DEVOPS_PAT` → prompt. **Press Enter at the prompt to use Windows auth** (the normal path for the on-prem server). Clear a stale PAT with `-ResetPat`.
+Scripts 1, 2, 3, 8, 9, 10, and 11 share one auth mechanism: PAT lookup order is `-Pat` arg → DPAPI cache at `%LOCALAPPDATA%\AdoTestPlanExtractor\pat.dat` → `$env:AZURE_DEVOPS_PAT` → prompt. **Press Enter at the prompt to use Windows auth** (the normal path for the on-prem server). Clear a stale PAT with `-ResetPat`. Scripts 10 and 11 accept `-Pat` and `-ApiVersion` but do not expose `-ResetPat`.
 
-**Script 9 is non-fatal.** If it fails, `Run-AdoExtracts.bat` warns and continues — the report renders without discussion icons rather than stopping the pipeline.
+**Scripts 9, 10, and 11 are non-fatal.** If any of them fails, `Run-AdoExtracts.bat` warns and continues — the report renders without discussion icons / Remaining Work history / TC state history respectively, rather than stopping the pipeline.
 
 ## GitHub Actions Automation
 

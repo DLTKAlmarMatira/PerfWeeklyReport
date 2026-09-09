@@ -131,6 +131,48 @@ function Get-DaysUntil {
     return $null
 }
 
+function Get-WorkingDaysUntil {
+    # Same contract as Get-DaysUntil but counts Mon-Fri days only.
+    # Negative return means overdue; null means no/unparseable date.
+    param([string]$IsoDate)
+    if ([string]::IsNullOrWhiteSpace($IsoDate)) { return $null }
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParse($IsoDate, [ref]$parsed)) { return $null }
+    $target = $parsed.Date
+    $start  = $AsOf.Date
+    if ($target -eq $start) { return 0 }
+    $step = if ($target -gt $start) { 1 } else { -1 }
+    $count = 0
+    $cur = $start.AddDays($step)
+    while (($step -eq 1 -and $cur -le $target) -or ($step -eq -1 -and $cur -ge $target)) {
+        if ($cur.DayOfWeek -ne [DayOfWeek]::Saturday -and $cur.DayOfWeek -ne [DayOfWeek]::Sunday) {
+            $count += $step
+        }
+        $cur = $cur.AddDays($step)
+    }
+    return $count
+}
+
+function Get-WorkingDaysSince {
+    # Mirrors Get-DaysSince but counts Mon-Fri days only. -1 = no date.
+    param([string]$IsoDate)
+    if ([string]::IsNullOrWhiteSpace($IsoDate)) { return -1 }
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParse($IsoDate, [ref]$parsed)) { return -1 }
+    $target = $parsed.Date
+    $start  = $AsOf.Date
+    if ($target -ge $start) { return 0 }   # future/same date → clamp
+    $count = 0
+    $cur = $target.AddDays(1)
+    while ($cur -le $start) {
+        if ($cur.DayOfWeek -ne [DayOfWeek]::Saturday -and $cur.DayOfWeek -ne [DayOfWeek]::Sunday) {
+            $count++
+        }
+        $cur = $cur.AddDays(1)
+    }
+    return $count
+}
+
 function Get-DateOnly {
     param([string]$IsoDate)
     if ([string]::IsNullOrWhiteSpace($IsoDate)) { return '' }
@@ -498,8 +540,9 @@ try {
             pbiTitle = $t.pbiTitle
             changedOn   = Get-DateOnly  $changedIso
             changedDays = Get-DaysSince $changedIso
-            closedOn    = Get-DateOnly  $closedIso
-            closedDays  = Get-DaysSince $closedIso
+            closedOn      = Get-DateOnly       $closedIso
+            closedDays    = Get-DaysSince       $closedIso
+            workClosedDays = Get-WorkingDaysSince $closedIso
             # Deadline pair. NO_TARGET keeps daysLeft numeric so the column
             # stays sortable and filterable; the UI checks targetOn to decide
             # whether to show anything at all.
@@ -524,12 +567,23 @@ try {
                 $d = Get-DaysUntil $t.pbiTarget
                 if ($null -eq $d) { 99999 } else { $d }
             )
+            workDaysLeft = $(
+                $d = Get-WorkingDaysUntil $t.pbiTarget
+                if ($null -eq $d) { 99999 } else { $d }
+            )
             # Length of the whole start->target window, so the page can draw an
             # elapsed meter without parsing dates in the browser (and without
             # drifting off the frozen asOf). 0 means "cannot draw a meter".
             windowDays  = $(
                 $s = Get-DaysUntil $t.pbiStart
                 $e = Get-DaysUntil $t.pbiTarget
+                if ($null -eq $s -or $null -eq $e) { 0 }
+                elseif (($e - $s) -le 0) { 0 }
+                else { [int]($e - $s) }
+            )
+            workWindowDays = $(
+                $s = Get-WorkingDaysUntil $t.pbiStart
+                $e = Get-WorkingDaysUntil $t.pbiTarget
                 if ($null -eq $s -or $null -eq $e) { 0 }
                 elseif (($e - $s) -le 0) { 0 }
                 else { [int]($e - $s) }
@@ -706,7 +760,7 @@ try {
   h2 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
   .sub { color: var(--ink-2); font-size: 12.5px; margin: 0; }
   .muted { color: var(--ink-muted); }
-  .scripting-status { text-align: center; vertical-align: middle; }
+  .scripting-status { text-align: left; vertical-align: middle; padding-left: 4em; }
   .rw-history, .tc-state-hist { font-size: 11.5px; margin-top: 4px; color: var(--ink-2); }
   .rw-label   { color: var(--ink-muted); }
   .rw-val     { font-weight: 500; }
@@ -1605,18 +1659,18 @@ try {
       return td;
     }
 
-    var win = item.windowDays || 0;
+    var win = item.workWindowDays || 0;
     var colour, over = false, days, pct, label;
 
     if (isDone) {
-      // FREEZE at completion. daysLeft is measured from today, so leaving a
+      // FREEZE at completion. workDaysLeft is measured from today, so leaving a
       // finished item on it would keep the meter ticking down for months and
       // eventually flip a long-since-delivered PBI to "50d over".
       //   target - closed = (target - today) + (today - closed)
-      //                   = daysLeft + closedDays
+      //                   = workDaysLeft + workClosedDays
       // Positive = finished early, negative = finished late.
-      var atClose = (item.closedDays !== undefined && item.closedDays !== null && item.closedDays >= 0)
-                  ? item.daysLeft + item.closedDays
+      var atClose = (item.workClosedDays !== undefined && item.workClosedDays !== null && item.workClosedDays >= 0)
+                  ? item.workDaysLeft + item.workClosedDays
                   : null;
       colour = "var(--st-na)";                       // history, never alarming
       if (atClose === null) {
@@ -1628,7 +1682,7 @@ try {
               : "done " + Math.abs(atClose) + "d late";
       }
     } else {
-      days = item.daysLeft;
+      days = item.workDaysLeft;
       pct  = win > 0 ? (win - days) / win : (days < 0 ? 1.2 : 1);
       if (days < 0)         { colour = "var(--mtr-late)"; over = true; }
       else if (pct >= 0.75) { colour = "var(--mtr-soon)"; }
@@ -1651,7 +1705,7 @@ try {
     // The dates the meter is built from stay reachable without hovering a
     // tooltip - native title works on touch-less keyboard focus too.
     td.title = (item.startOn ? item.startOn : "?") + "  ->  " + item.targetOn +
-               (win > 0 ? "   (" + win + " day window, " + Math.round(pct * 100) + "% elapsed)" : "") +
+               (win > 0 ? "   (" + win + " working-day window, " + Math.round(pct * 100) + "% elapsed)" : "") +
                (isDone && item.closedOn ? "   closed " + item.closedOn : "");
     td.appendChild(wrap);
     return td;
@@ -1712,8 +1766,8 @@ try {
       if (t.targetOn && t.state !== "Done" && (g.soonest === null || t.daysLeft < g.soonest)) {
         g.soonest = t.daysLeft; g.soonestOn = t.targetOn;
       }
-      if (t.state !== "Done" && t.remWork > 0 && t.daysLeft < 99999) {
-        var effDays = Math.max(t.daysLeft, 1);
+      if (t.state !== "Done" && t.remWork > 0 && t.workDaysLeft < 99999) {
+        var effDays = Math.max(t.workDaysLeft, 1);
         g.capRate += t.remWork / effDays;
         g.capRem  += t.remWork;
       }
@@ -1721,7 +1775,8 @@ try {
       if (!g.pbis[pk]) {
         g.pbis[pk] = { id: t.pbiId, title: t.pbiTitle || "(no PBI parent)", product: t.product || "", tasks: 0,
                        targetOn: t.targetOn, daysLeft: t.daysLeft, startOn: t.startOn,
-                       windowDays: t.windowDays, closedDays: null, closedOn: "",
+                       windowDays: t.windowDays, workDaysLeft: t.workDaysLeft, workWindowDays: t.workWindowDays,
+                       closedDays: null, closedOn: "", workClosedDays: null,
                        // Bugs hang off the PBI, so every task of a PBI reports
                        // the same set - take it, don't accumulate it.
                        bugs: t.bugIds ? t.bugIds.split(",").filter(Boolean).length : 0,
@@ -1733,16 +1788,17 @@ try {
       if (g.pbis[pk][t.state] === undefined) g.pbis[pk][t.state] = 0;
       g.pbis[pk][t.state]++;
       g.pbis[pk]["u_" + urgencyOf(t)]++;
-      if (t.state !== "Done" && t.remWork > 0 && t.daysLeft < 99999) {
-        var effDays = Math.max(t.daysLeft, 1);
+      if (t.state !== "Done" && t.remWork > 0 && t.workDaysLeft < 99999) {
+        var effDays = Math.max(t.workDaysLeft, 1);
         g.pbis[pk].capRem  += t.remWork;
         g.pbis[pk].capRate += t.remWork / effDays;
       }
       // A PBI finishes when its LAST task does, i.e. the most recent close =
       // the SMALLEST closedDays (fewest days ago).
       if (t.closedDays >= 0 && (g.pbis[pk].closedDays === null || t.closedDays < g.pbis[pk].closedDays)) {
-        g.pbis[pk].closedDays = t.closedDays;
-        g.pbis[pk].closedOn   = t.closedOn;
+        g.pbis[pk].closedDays     = t.closedDays;
+        g.pbis[pk].closedOn       = t.closedOn;
+        g.pbis[pk].workClosedDays = t.workClosedDays;
       }
     });
     return order.map(function (k) { return map[k]; })
@@ -2219,11 +2275,7 @@ try {
           if (dsnChanged) weekParts.push(
             "Design " + '<span class="tc-design">' + fmt(task.tcDesign7Ago) + " " + GL.arrow + " " + fmt(task.tcDesign) + "</span>"
           );
-          if (task.remWorkOld !== null && task.remWorkNew !== null) {
-            var rwOld = task.remWorkOld !== "" ? task.remWorkOld + "h" : GL.mdash;
-            var rwNew = task.remWorkNew !== "" ? task.remWorkNew + "h" : GL.mdash;
-            weekParts.push("Work " + rwOld + " " + GL.arrow + " " + rwNew);
-          }
+
           var weekLine = '<div class="rw-history"><span class="rw-label">7d: </span>';
           if (weekParts.length > 0) {
             weekLine += weekParts.join(' <span class="tc-sep">' + GL.dot + "</span> ");
