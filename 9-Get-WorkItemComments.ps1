@@ -133,7 +133,9 @@ try {
                 $author = if ($entry.revisedBy -and $entry.revisedBy.displayName) {
                               [string]$entry.revisedBy.displayName
                           } else { '' }
-                $date = if ($entry.revisedDate) { [string]$entry.revisedDate } else { '' }
+                $date = if ($entry.fields.'System.ChangedDate' -and $entry.fields.'System.ChangedDate'.newValue) {
+                            [string]$entry.fields.'System.ChangedDate'.newValue
+                        } else { '' }
 
                 $results.Add([pscustomobject][ordered]@{
                     WorkItemId  = $id

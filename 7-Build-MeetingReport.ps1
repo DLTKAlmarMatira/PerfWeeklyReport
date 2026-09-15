@@ -1022,6 +1022,9 @@ try {
   .colfoot .sub { margin: 0; }
   .colfoot button { margin-left: auto; }
   .meta-line { color: var(--ink-muted); font-size: 11.5px; margin-top: 2px; }
+  .flag-row { border-left: 3px solid #fab219; }
+  .flag-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .flag-chip { font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: #fab21922; border: 1px solid #fab219; color: #b07800; white-space: nowrap; }
   .pill { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--ink-2); white-space: nowrap; }
   .empty { padding: 28px 8px; text-align: center; color: var(--ink-muted); }
   .hidden { display: none !important; }
@@ -1336,6 +1339,23 @@ try {
   // changedDays / closedDays are -1 when the date is absent, so a plain
   // "<= 7" test would wrongly match those. Always require >= 0 first.
   function withinDays(value, limit) { return value >= 0 && value <= limit; }
+  function daysAgoDate(n) {
+    if (n < 0) return "";
+    var d = new Date(META.asOf + "T00:00:00");
+    d.setDate(d.getDate() - n);
+    return d.toISOString().slice(0, 10);
+  }
+  // Most recent activity across: task state change, latest comment, TC state change.
+  function lastActivity(task) {
+    var days = task.changedDays, on = task.changedOn;
+    if (task.discDays >= 0 && (days < 0 || task.discDays < days)) {
+      days = task.discDays; on = daysAgoDate(task.discDays);
+    }
+    if (task.tcStateChangeDays >= 0 && (days < 0 || task.tcStateChangeDays < days)) {
+      days = task.tcStateChangeDays; on = daysAgoDate(task.tcStateChangeDays);
+    }
+    return { days: days, on: on };
+  }
 
   var ACTIVITY = {
     w7:  function (t) { return withinDays(t.changedDays, 7)  || withinDays(t.discDays, 7)  || withinDays(t.tcStateChangeDays, 7);  },
@@ -1673,20 +1693,14 @@ try {
                   ? item.workDaysLeft + item.workClosedDays
                   : null;
       colour = "var(--st-na)";                       // history, never alarming
-      if (atClose === null) {
-        pct = 1; label = "done";                     // done, close date unknown
-      } else {
-        pct = win > 0 ? (win - atClose) / win : 1;
-        label = atClose > 0 ? "done " + atClose + "d early"
-              : atClose === 0 ? "done on time"
-              : "done " + Math.abs(atClose) + "d late";
-      }
+      pct = atClose !== null && win > 0 ? (win - atClose) / win : 1;
+      label = "Done";
     } else {
       days = item.workDaysLeft;
       pct  = win > 0 ? (win - days) / win : (days < 0 ? 1.2 : 1);
-      if (days < 0)         { colour = "var(--mtr-late)"; over = true; }
-      else if (pct >= 0.75) { colour = "var(--mtr-soon)"; }
-      else                  { colour = "var(--mtr-ok)"; }
+      if (days < 0)       { colour = "var(--mtr-late)"; over = true; }
+      else if (days <= 14) { colour = "var(--mtr-soon)"; }
+      else                 { colour = "var(--mtr-ok)"; }
       label = days < 0 ? Math.abs(days) + "d over" : days === 0 ? "today" : days + "d";
     }
 
@@ -1712,6 +1726,7 @@ try {
   }
 
   function urgencyOf(t) {
+    if (t.state === "Done") return "none";
     for (var i = 0; i < URGENCY.length; i++) { if (URGENCY[i].test(t)) return URGENCY[i].key; }
     return "none";
   }
@@ -1739,6 +1754,18 @@ try {
       li.appendChild(el("span", null, (d.glyph ? d.glyph + "  " : "") + d.label));
       ul.appendChild(li);
     });
+  }
+
+  function taskFlags(task) {
+    var f = [];
+    if (task.state !== "Done") {
+      if (task.discDays === -1 || task.discDays > 7)                              f.push("No comment");
+      if (!task.targetOn)                                                          f.push("No target date");
+      if (task.kind === "Scripting" && task.remWorkNew === null)                   f.push("No remaining work");
+      if (task.kind === "Execution" && task.state === "In Progress" && task.exec === 0 && task.cases > 0) f.push("Execution not started");
+      if ((task.kind === "Scripting" || task.kind === "Execution") && task.cases === 0) f.push("No cases linked");
+    }
+    return f;
   }
 
   function loadGroups(rows) {
@@ -1788,6 +1815,7 @@ try {
       if (g.pbis[pk][t.state] === undefined) g.pbis[pk][t.state] = 0;
       g.pbis[pk][t.state]++;
       g.pbis[pk]["u_" + urgencyOf(t)]++;
+      if (taskFlags(t).length) g.pbis[pk].hasIncomplete = true;
       if (t.state !== "Done" && t.remWork > 0 && t.workDaysLeft < 99999) {
         var effDays = Math.max(t.workDaysLeft, 1);
         g.pbis[pk].capRem  += t.remWork;
@@ -1921,7 +1949,7 @@ try {
     var tb = el("tbody");
     groups.forEach(function (g) {
       var pbis = Object.keys(g.pbis).map(function (k) { return g.pbis[k]; })
-                       .sort(function (a, b) { return b.tasks - a.tasks; });
+                       .sort(function (a, b) { return (a.product || "").localeCompare(b.product || ""); });
 
       // --- group (subtotal) row ---
       var sr = el("tr");
@@ -1964,7 +1992,15 @@ try {
         })(pbiKey);
         tr.appendChild(el("td", null, ""));
         var c = el("td");
-        c.appendChild(el("div", null, p.title));
+        var titleWrap = el("div");
+        titleWrap.appendChild(document.createTextNode(p.title));
+        if (p.hasIncomplete) {
+          var ast = el("span", null, " *");
+          ast.style.cssText = "color:#c0392b;font-weight:700;";
+          ast.title = "One or more tasks under this PBI have incomplete items";
+          titleWrap.appendChild(ast);
+        }
+        c.appendChild(titleWrap);
         if (p.id) c.appendChild(el("div", "meta-line", "PBI " + p.id));
         tr.appendChild(c);
         tr.appendChild(el("td", p.product ? null : "muted", p.product || GL.mdash));
@@ -2198,11 +2234,20 @@ try {
     sorted.forEach(function (task) {
       var tr = el("tr");
 
+      // --- incomplete flags (active tasks only) ---
+      var flags = taskFlags(task);
+      if (flags.length) tr.className = "flag-row";
+
       var td = el("td");
       td.appendChild(el("div", "tasktitle", task.title));
       var meta = "#" + task.id;
       if (task.testers) meta += SEP + "tested by " + task.testers;
       td.appendChild(el("div", "meta-line", meta));
+      if (flags.length) {
+        var chips = el("div", "flag-chips");
+        flags.forEach(function (f) { chips.appendChild(el("span", "flag-chip", f)); });
+        td.appendChild(chips);
+      }
       tr.appendChild(td);
 
       var kindTd = el("td");
@@ -2216,14 +2261,15 @@ try {
       tr.appendChild(el("td", "nowrap", task.assignee));
 
       var chg = el("td", "num nowrap");
-      if (task.changedDays < 0) {
+      var act = lastActivity(task);
+      if (act.days < 0) {
         chg.className += " muted";
         chg.textContent = GL.mdash;
       } else {
-        chg.appendChild(el("div", null, task.changedOn));
-        var age = task.changedDays === 0 ? "today"
-                : task.changedDays === 1 ? "1 day ago"
-                : task.changedDays + " days ago";
+        chg.appendChild(el("div", null, act.on));
+        var age = act.days === 0 ? "today"
+                : act.days === 1 ? "1 day ago"
+                : act.days + " days ago";
         chg.appendChild(el("div", "meta-line", age));
       }
       tr.appendChild(chg);
@@ -2266,24 +2312,7 @@ try {
             '<span class="tc-ready">' + fmt(task.tcReady) + "/" + fmt(task.cases) + " Ready (" + pct + "%)</span>",
             '<span class="tc-design">' + fmt(task.tcDesign) + " Design</span>"
           ];
-          var weekParts = [];
-          var rdyChanged = task.tcReady7Ago  !== task.tcReady;
-          var dsnChanged = task.tcDesign7Ago !== task.tcDesign;
-          if (rdyChanged) weekParts.push(
-            "Ready " + '<span class="tc-ready">'  + fmt(task.tcReady7Ago)  + " " + GL.arrow + " " + fmt(task.tcReady)  + "</span>"
-          );
-          if (dsnChanged) weekParts.push(
-            "Design " + '<span class="tc-design">' + fmt(task.tcDesign7Ago) + " " + GL.arrow + " " + fmt(task.tcDesign) + "</span>"
-          );
-
-          var weekLine = '<div class="rw-history"><span class="rw-label">7d: </span>';
-          if (weekParts.length > 0) {
-            weekLine += weekParts.join(' <span class="tc-sep">' + GL.dot + "</span> ");
-          } else {
-            weekLine += '<span class="rw-none">no changes</span>';
-          }
-          weekLine += "</div>";
-          sc.innerHTML = parts.join('<span class="tc-sep">' + GL.dot + "</span>") + weekLine;
+          sc.innerHTML = parts.join('<span class="tc-sep">' + GL.dot + "</span>");
           tr.appendChild(sc);
         } else {
           ["points", "passed", "failed", "blocked", "na", "never"].forEach(function () {
