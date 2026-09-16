@@ -90,11 +90,25 @@ try {
     $taskIds = @($rows |
                  Where-Object { $_.'Target System.WorkItemType' -eq 'Task' -and $_.'Target ID' } |
                  Select-Object -ExpandProperty 'Target ID' | Sort-Object -Unique)
-    $allIds = @(($pbiIds + $taskIds) | Sort-Object -Unique)
+
+    # Also pick up orphaned tasks (no PBI parent) that appear only in
+    # task_tests_link_results.csv and would otherwise never be queried.
+    $taskTestsPath = Join-Path $CsvDir 'task_tests_link_results.csv'
+    $orphanTaskIds = @()
+    if (Test-Path -LiteralPath $taskTestsPath) {
+        $orphanTaskIds = @(Import-Csv -LiteralPath $taskTestsPath |
+            Where-Object { $_.'Link Type' -ne '(root)' -and $_.'Source ID' } |
+            Select-Object -ExpandProperty 'Source ID' | Sort-Object -Unique |
+            Where-Object { $_ -notin $taskIds })
+        if ($orphanTaskIds.Count -gt 0) {
+            Write-Host ("Orphaned tasks (no PBI parent) added: {0}" -f $orphanTaskIds.Count)
+        }
+    }
+    $allIds = @(($pbiIds + $taskIds + $orphanTaskIds) | Sort-Object -Unique)
 
     if ($allIds.Count -eq 0) { throw "No PBI or Task IDs found in $pbiTaskPath" }
-    Write-Host ("Work items to check: {0} PBI(s) + {1} Task(s) = {2} total" -f `
-        $pbiIds.Count, $taskIds.Count, $allIds.Count)
+    Write-Host ("Work items to check: {0} PBI(s) + {1} Task(s) + {2} orphan(s) = {3} total" -f `
+        $pbiIds.Count, $taskIds.Count, $orphanTaskIds.Count, $allIds.Count)
 
     # API version probe against the updates endpoint.
     if (-not $ApiVersion) {

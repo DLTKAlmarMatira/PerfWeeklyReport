@@ -105,13 +105,23 @@ function Get-ProductFromIteration {
 # embedded in the page. If the browser computed "days ago" against its own
 # clock, a report opened next Tuesday would silently relabel last week's work
 # as current. A generated report should be a fixed snapshot.
-$AsOf = Get-Date
+$AsOf = [datetime]::UtcNow
+
+# Parse an ISO date/datetime string as UTC regardless of the machine's local
+# timezone. TryParse without RoundtripKind treats the Z suffix as local time
+# on Windows, which shifts day counts by the UTC offset of the runner.
+$_IsoStyles = [System.Globalization.DateTimeStyles]::RoundtripKind
+$_IcCulture = [System.Globalization.CultureInfo]::InvariantCulture
+function Parse-IsoUtc {
+    param([string]$IsoDate, [ref]$Result)
+    return [datetime]::TryParse($IsoDate, $_IcCulture, $_IsoStyles, $Result)
+}
 
 function Get-DaysSince {
     param([string]$IsoDate)
     if ([string]::IsNullOrWhiteSpace($IsoDate)) { return -1 }   # -1 = no date
     $parsed = [datetime]::MinValue
-    if ([datetime]::TryParse($IsoDate, [ref]$parsed)) {
+    if (Parse-IsoUtc $IsoDate ([ref]$parsed)) {
         $days = [int][math]::Floor(($AsOf - $parsed).TotalDays)
         if ($days -lt 0) { return 0 }
         return $days
@@ -125,7 +135,7 @@ function Get-DaysUntil {
     param([string]$IsoDate)
     if ([string]::IsNullOrWhiteSpace($IsoDate)) { return $null }
     $parsed = [datetime]::MinValue
-    if ([datetime]::TryParse($IsoDate, [ref]$parsed)) {
+    if (Parse-IsoUtc $IsoDate ([ref]$parsed)) {
         return [int][math]::Floor(($parsed.Date - $AsOf.Date).TotalDays)
     }
     return $null
@@ -137,7 +147,7 @@ function Get-WorkingDaysUntil {
     param([string]$IsoDate)
     if ([string]::IsNullOrWhiteSpace($IsoDate)) { return $null }
     $parsed = [datetime]::MinValue
-    if (-not [datetime]::TryParse($IsoDate, [ref]$parsed)) { return $null }
+    if (-not (Parse-IsoUtc $IsoDate ([ref]$parsed))) { return $null }
     $target = $parsed.Date
     $start  = $AsOf.Date
     if ($target -eq $start) { return 0 }
@@ -158,10 +168,10 @@ function Get-WorkingDaysSince {
     param([string]$IsoDate)
     if ([string]::IsNullOrWhiteSpace($IsoDate)) { return -1 }
     $parsed = [datetime]::MinValue
-    if (-not [datetime]::TryParse($IsoDate, [ref]$parsed)) { return -1 }
+    if (-not (Parse-IsoUtc $IsoDate ([ref]$parsed))) { return -1 }
     $target = $parsed.Date
     $start  = $AsOf.Date
-    if ($target -ge $start) { return 0 }   # future/same date → clamp
+    if ($target -ge $start) { return 0 }   # future/same date -> clamp
     $count = 0
     $cur = $target.AddDays(1)
     while ($cur -le $start) {
@@ -177,7 +187,7 @@ function Get-DateOnly {
     param([string]$IsoDate)
     if ([string]::IsNullOrWhiteSpace($IsoDate)) { return '' }
     $parsed = [datetime]::MinValue
-    if ([datetime]::TryParse($IsoDate, [ref]$parsed)) { return $parsed.ToString('yyyy-MM-dd') }
+    if (Parse-IsoUtc $IsoDate ([ref]$parsed)) { return $parsed.ToString('yyyy-MM-dd') }
     return ''
 }
 
@@ -225,6 +235,60 @@ try {
 
     # --- Bugs linked to each PBI, from 8-Get-PbiBugLinks.ps1. Optional: an
     # --- older csv folder simply yields no bug counts rather than an error.
+    # --- Previous bug counts for delta detection. Written after each build so
+    # --- the next run can show +N when a new bug is linked.
+    $bugCountsPrevPath = Join-Path $CsvDir 'bug_counts_prev.json'
+    $bugCountsPrev = @{}
+    if (Test-Path -LiteralPath $bugCountsPrevPath) {
+        try {
+            $prevJson = Get-Content -LiteralPath $bugCountsPrevPath -Raw -Encoding UTF8
+            (ConvertFrom-Json $prevJson).PSObject.Properties | ForEach-Object {
+                $bugCountsPrev[$_.Name] = [int]$_.Value
+            }
+            Write-Host ("Previous bug counts loaded: {0} task(s)" -f $bugCountsPrev.Count)
+        } catch {
+            Write-Warning "Could not read bug_counts_prev.json - delta will not be shown this run."
+        }
+    }
+
+    # --- Rolling history of weekly status counts for the trend chart.
+    # --- Each run appends one entry keyed by asOf date; capped at 12 weeks.
+    # --- The previous entry (second-to-last after append) drives the delta tiles.
+    $statusHistPath = Join-Path $CsvDir 'status_counts_history.json'
+    $statusHistory  = [System.Collections.Generic.List[object]]::new()
+    if (Test-Path -LiteralPath $statusHistPath) {
+        try {
+            $loaded = ConvertFrom-Json (Get-Content -LiteralPath $statusHistPath -Raw -Encoding UTF8)
+            foreach ($e in @($loaded)) { $statusHistory.Add($e) }
+            Write-Host ("Status history loaded: {0} week(s)" -f $statusHistory.Count)
+        } catch {
+            Write-Warning "Could not read status_counts_history.json - starting fresh history."
+        }
+    }
+    # Seed from the legacy single-snapshot file when history is empty on first
+    # migration. Use asOf-7d as the approximate date since the file has none.
+    if ($statusHistory.Count -eq 0) {
+        $legacyPrevPath = Join-Path $CsvDir 'status_counts_prev.json'
+        if (Test-Path -LiteralPath $legacyPrevPath) {
+            try {
+                $legacyPrev = ConvertFrom-Json (Get-Content -LiteralPath $legacyPrevPath -Raw -Encoding UTF8)
+                $seedDate   = $AsOf.AddDays(-7).ToString('yyyy-MM-dd')
+                $statusHistory.Add([pscustomobject]@{
+                    date       = $seedDate
+                    toDo       = [int]$legacyPrev.toDo
+                    inProgress = [int]$legacyPrev.inProgress
+                    done       = [int]$legacyPrev.done
+                    bugs       = [int]$legacyPrev.bugs
+                })
+                Write-Host ("Seeded history from legacy snapshot (date: {0})" -f $seedDate)
+            } catch {
+                Write-Warning "Could not seed from status_counts_prev.json."
+            }
+        }
+    }
+    # Derive previous counts from the last history entry (for delta tiles).
+    $statusPrev = if ($statusHistory.Count -gt 0) { $statusHistory[$statusHistory.Count - 1] } else { $null }
+
     # --- Only Target Type = 'Bug' counts - a "Related" link also points at
     # --- other PBIs and Tasks, so counting all of them would be wrong.
     $bugsByPbi = @{}
@@ -324,7 +388,7 @@ try {
     if (Test-Path -LiteralPath $tcStateHistPath) {
         foreach ($r in (Import-Csv -LiteralPath $tcStateHistPath)) {
             if ($r.TestCaseId) {
-                # Treat the 9999-01-01 TFS sentinel as no date — it means the
+                # Treat the 9999-01-01 TFS sentinel as no date - it means the
                 # revision is the current live one and carries no real timestamp.
                 # Get-DaysSince would clamp it to 0, causing false filter hits.
                 $safeDate = if ($r.RevisionDate -notlike '9999*') { $r.RevisionDate } else { '' }
@@ -394,6 +458,28 @@ try {
     }
 
     Write-Host ("Read {0} joined rows" -f $connected.Count)
+
+    # Deduplicate Test Suite rows: per (Task ID, Test Case ID) keep only the row
+    # with the highest Suite ID (highest ID = latest suite = most-recent run).
+    # Scripting rows (Target Type = Test Case) are left untouched - they don't
+    # contribute to outcome counts and deduping them would hide valid case links.
+    $suiteRowList    = [System.Collections.Generic.List[object]]::new()
+    $nonSuiteRowList = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $connected) {
+        if ($r.'Target Type' -eq 'Test Suite') { $suiteRowList.Add($r) }
+        else                                   { $nonSuiteRowList.Add($r) }
+    }
+    $bestSuite = @{}
+    foreach ($r in $suiteRowList) {
+        $key = $r.'Task ID' + '|' + $r.'Test Case ID'
+        $sid = 0; [int]::TryParse($r.'Suite ID', [ref]$sid) | Out-Null
+        if (-not $bestSuite.ContainsKey($key) -or $sid -gt $bestSuite[$key].sid) {
+            $bestSuite[$key] = @{ sid = $sid; row = $r }
+        }
+    }
+    $connected = @($nonSuiteRowList) + @($bestSuite.Values | ForEach-Object { $_.row })
+    Write-Host ("After latest-suite dedup: {0} rows ({1} suite-linked TCs, {2} scripting-linked)" -f `
+        $connected.Count, $bestSuite.Count, $nonSuiteRowList.Count)
 
     # --- Aggregate to one record per task. Filters are all task-level
     # --- attributes, so the browser can re-scope everything by filtering this
@@ -563,6 +649,11 @@ try {
                 }
                 if ($bugSet.Count) { (@($bugSet) | Sort-Object) -join ',' } else { '' }
             )
+            bugDelta    = $(
+                $curCount = $bugSet.Count
+                $prevCount = if ($bugCountsPrev.ContainsKey($t.id)) { $bugCountsPrev[$t.id] } else { $null }
+                if ($null -ne $prevCount -and $curCount -gt $prevCount) { $curCount - $prevCount } else { 0 }
+            )
             daysLeft    = $(
                 $d = Get-DaysUntil $t.pbiTarget
                 if ($null -eq $d) { 99999 } else { $d }
@@ -626,6 +717,30 @@ try {
     $execTotal = ($tasks | Measure-Object -Property exec -Sum).Sum
     Write-Host ("Aggregated to {0} tasks; {1} test-plan-sourced test points" -f $tasks.Count, $execTotal)
 
+    # --- Week-over-week task-state and bug counts. Loaded at the top alongside
+    # --- bug_counts_prev.json; written at the end so the next run can show
+    # --- deltas. Uses $tasks, so must run after the aggregation loop.
+    $cntToDo  = @($tasks | Where-Object { $_.state -eq 'To Do' }).Count
+    $cntInPrg = @($tasks | Where-Object { $_.state -eq 'In Progress' }).Count
+    $cntDone  = @($tasks | Where-Object { $_.state -eq 'Done' }).Count
+    $cntBugs  = [int]($tasks | ForEach-Object {
+        if ($_.bugIds) { ($_.bugIds -split ',').Count } else { 0 }
+    } | Measure-Object -Sum).Sum
+
+    function Get-StatusDelta([int]$cur, $prev, [string]$key) {
+        if ($null -eq $prev) { return $null }
+        $p = $prev.$key
+        if ($null -eq $p) { return $null }
+        return $cur - [int]$p
+    }
+
+    # Build updated history: dedup by date, append today, cap at 12.
+    $asOfStr = $AsOf.ToString('yyyy-MM-dd')
+    $updatedHistory = [System.Collections.Generic.List[object]]::new()
+    foreach ($e in @($statusHistory | Where-Object { $_.date -ne $asOfStr })) { $updatedHistory.Add($e) }
+    $updatedHistory.Add([pscustomobject]@{ date=$asOfStr; toDo=$cntToDo; inProgress=$cntInPrg; done=$cntDone; bugs=$cntBugs })
+    while ($updatedHistory.Count -gt 12) { $updatedHistory.RemoveAt(0) }
+
     # Built from char codes so this script file contains no non-ASCII bytes at
     # all. ConvertTo-Json emits them as \uXXXX escapes, so the generated HTML is
     # pure ASCII too and cannot be mangled by a codepage mismatch.
@@ -661,6 +776,20 @@ try {
             targetNote  = 'Start = PBI created date. Target = the PBI field ADO labels "Planned Hot Fix Release Date", repurposed by the perf team as the delivery target.'
             withTarget  = [int](@($tasks | Where-Object { $_.targetOn }).Count)
             bugUnreadable = [int]$bugUnreadable
+            tfsBase       = 'https://tfs.deltek.com/tfs/Deltek/QEAutomation/_workitems/edit/'
+            statusCounts = [pscustomobject]@{
+                toDo       = $cntToDo
+                inProgress = $cntInPrg
+                done       = $cntDone
+                bugs       = $cntBugs
+            }
+            statusDeltas = [pscustomobject]@{
+                toDo       = (Get-StatusDelta $cntToDo  $statusPrev 'toDo')
+                inProgress = (Get-StatusDelta $cntInPrg $statusPrev 'inProgress')
+                done       = (Get-StatusDelta $cntDone  $statusPrev 'done')
+                bugs       = (Get-StatusDelta $cntBugs  $statusPrev 'bugs')
+            }
+            statusHistory = @($updatedHistory)
         }
         tasks = $tasks
     }
@@ -881,6 +1010,8 @@ try {
   .tile .value { font-size: 26px; font-weight: 600; line-height: 1.15; }
   .tile .label { font-size: 12.5px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
   .tile .pct { font-size: 11.5px; color: var(--ink-muted); }
+  .delta-good { color: var(--st-good); font-weight: 600; }
+  .delta-bad  { color: var(--st-critical); font-weight: 600; }
   /* Status colour never carries meaning alone - it always ships with this
      glyph and the text label beside it. */
   .glyph {
@@ -938,6 +1069,9 @@ try {
   th.sortable:hover { color: var(--ink); }
   tbody tr:hover { background: var(--plane); }
   .pbi-row { cursor: pointer; }
+  a.tfs-link { color: var(--ink-muted); margin-left: 5px; vertical-align: middle;
+               text-decoration: none; opacity: .55; display: inline-flex; }
+  a.tfs-link:hover { opacity: 1; color: var(--ts-doing); }
   .pbi-selected { background: rgba(57,135,229,0.10); box-shadow: inset 3px 0 0 var(--ts-doing); }
   .pbi-selected:hover { background: rgba(57,135,229,0.15); }
   .disc-btn { background: none; border: none; cursor: pointer; padding: 2px 5px; color: var(--ink-2); border-radius: 4px; line-height: 1; }
@@ -1022,6 +1156,7 @@ try {
   .colfoot .sub { margin: 0; }
   .colfoot button { margin-left: auto; }
   .meta-line { color: var(--ink-muted); font-size: 11.5px; margin-top: 2px; }
+  .bug-delta { margin-left: 4px; font-size: 10.5px; font-weight: 600; color: #c0392b; }
   .flag-row { border-left: 3px solid #fab219; }
   .flag-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
   .flag-chip { font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: #fab21922; border: 1px solid #fab219; color: #b07800; white-space: nowrap; }
@@ -1052,6 +1187,8 @@ try {
     .card { break-inside: avoid; border-color: #ccc; }
     .filters, #themeBtn, #tableBtn, #tip { display: none !important; }
   }
+
+
 </style>
 </head>
 <body>
@@ -1129,6 +1266,12 @@ try {
 <div id="mistakeBanner" class="banner hidden" style="margin-bottom:16px">
   <strong id="mistakeCount"></strong>
   <span>link(s) in scope use a <code>Child</code> relationship where <code>Tests</code> is required, so they are missing from ADO traceability. See <code>exceptions_weekly.csv</code>.</span>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <h2 style="margin-bottom:12px">Weekly Status</h2>
+  <div id="statusChart" style="margin-bottom:16px"></div>
+  <div class="kpis" id="statusDash"></div>
 </div>
 
 <div class="card">
@@ -1351,15 +1494,15 @@ try {
     if (task.discDays >= 0 && (days < 0 || task.discDays < days)) {
       days = task.discDays; on = daysAgoDate(task.discDays);
     }
-    if (task.tcStateChangeDays >= 0 && (days < 0 || task.tcStateChangeDays < days)) {
+    if (task.state !== "Done" && task.tcStateChangeDays >= 0 && (days < 0 || task.tcStateChangeDays < days)) {
       days = task.tcStateChangeDays; on = daysAgoDate(task.tcStateChangeDays);
     }
     return { days: days, on: on };
   }
 
   var ACTIVITY = {
-    w7:  function (t) { return withinDays(t.changedDays, 7)  || withinDays(t.discDays, 7)  || withinDays(t.tcStateChangeDays, 7);  },
-    w14: function (t) { return withinDays(t.changedDays, 14) || withinDays(t.discDays, 14) || withinDays(t.tcStateChangeDays, 14); },
+    w7:  function (t) { return withinDays(t.changedDays, 7)  || withinDays(t.discDays, 7)  || (t.state !== "Done" && withinDays(t.tcStateChangeDays, 7));  },
+    w14: function (t) { return withinDays(t.changedDays, 14) || withinDays(t.discDays, 14) || (t.state !== "Done" && withinDays(t.tcStateChangeDays, 14)); },
     c7:  function (t) { return withinDays(t.closedDays, 7); },
     c30: function (t) { return withinDays(t.closedDays, 30); },
     // ISO string comparison works for YYYY-MM-DD dates (lexicographic = chronological).
@@ -1501,6 +1644,154 @@ try {
       tile.appendChild(el("div", "value", t.isNote ? GL.mdash : fmt(t.value)));
       tile.appendChild(el("div", "label", t.label));
       tile.appendChild(el("div", "pct", t.sub));
+      wrap.appendChild(tile);
+    });
+  }
+
+  // ---- weekly status trend chart (SVG, pure DOM, no CDN) --------------------
+  function renderStatusChart() {
+    var wrap = $("statusChart");
+    wrap.textContent = "";
+    var history = META.statusHistory;
+    if (!history || history.length < 1) {
+      var msg = el("p", "muted");
+      msg.style.cssText = "font-size:12px;margin:0";
+      msg.textContent = "Trend chart appears after the first weekly run.";
+      wrap.appendChild(msg);
+      return;
+    }
+
+    var LINES = [
+      { key: "done",       label: "Done",        color: "#22c55e", dash: ""    },
+      { key: "inProgress", label: "In Progress",  color: "#3b82f6", dash: "5,3" },
+      { key: "toDo",       label: "To Do",        color: "#f97316", dash: "4,2" },
+      { key: "bugs",       label: "Bugs",          color: "#ef4444", dash: "2,2" }
+    ];
+
+    var W = 560, H = 160;
+    var PAD = { top: 14, right: 12, bottom: 30, left: 34 };
+    var iW  = W - PAD.left - PAD.right;
+    var iH  = H - PAD.top  - PAD.bottom;
+    var n   = history.length;
+
+    var allVals = [];
+    history.forEach(function (r) {
+      LINES.forEach(function (l) { allVals.push(r[l.key] || 0); });
+    });
+    var maxV = Math.max.apply(null, allVals) || 1;
+
+    function xPos(i) { return PAD.left + (n < 2 ? iW / 2 : i * iW / (n - 1)); }
+    function yPos(v) { return PAD.top + iH - (v / maxV) * iH; }
+
+    var NS  = "http://www.w3.org/2000/svg";
+    function svgEl(tag, attrs) {
+      var e = document.createElementNS(NS, tag);
+      Object.keys(attrs).forEach(function (k) { e.setAttribute(k, attrs[k]); });
+      return e;
+    }
+
+    var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, width: "100%", height: H });
+    svg.style.overflow = "visible";
+    svg.style.display  = "block";
+
+    // Y gridlines + labels (4 steps)
+    var steps = 4;
+    for (var s = 0; s <= steps; s++) {
+      var v  = Math.round(maxV * s / steps);
+      var y  = yPos(v);
+      svg.appendChild(svgEl("line", { x1: PAD.left, x2: PAD.left + iW, y1: y, y2: y,
+        stroke: "var(--rule)", "stroke-width": 1 }));
+      var lbl = document.createElementNS(NS, "text");
+      lbl.setAttribute("x", PAD.left - 4); lbl.setAttribute("y", y + 4);
+      lbl.setAttribute("text-anchor", "end"); lbl.setAttribute("font-size", "10");
+      lbl.setAttribute("fill", "var(--ink-muted)"); lbl.textContent = v;
+      svg.appendChild(lbl);
+    }
+
+    // X axis date labels
+    history.forEach(function (r, i) {
+      var lbl = document.createElementNS(NS, "text");
+      lbl.setAttribute("x", xPos(i)); lbl.setAttribute("y", PAD.top + iH + 16);
+      lbl.setAttribute("text-anchor", "middle"); lbl.setAttribute("font-size", "10");
+      lbl.setAttribute("fill", "var(--ink-muted)");
+      lbl.textContent = (r.date || "").slice(5); // MM-DD
+      svg.appendChild(lbl);
+    });
+
+    // Lines and dots (polyline omitted when only 1 point - dots still render)
+    LINES.forEach(function (def) {
+      if (history.length > 1) {
+        var pts = history.map(function (r, i) {
+          return xPos(i) + "," + yPos(r[def.key] || 0);
+        }).join(" ");
+        var attrs = { points: pts, fill: "none", stroke: def.color, "stroke-width": 2, "stroke-linejoin": "round" };
+        if (def.dash) attrs["stroke-dasharray"] = def.dash;
+        svg.appendChild(svgEl("polyline", attrs));
+      }
+
+      history.forEach(function (r, i) {
+        svg.appendChild(svgEl("circle", {
+          cx: xPos(i), cy: yPos(r[def.key] || 0), r: 3, fill: def.color
+        }));
+      });
+    });
+
+    wrap.appendChild(svg);
+
+    // Inline legend
+    var leg = el("div");
+    leg.style.cssText = "display:flex;gap:14px;flex-wrap:wrap;margin-top:6px;font-size:11.5px";
+    LINES.forEach(function (def) {
+      var item = el("span");
+      item.style.cssText = "display:inline-flex;align-items:center;gap:5px;color:var(--ink-2)";
+      var sw = document.createElement("span");
+      sw.style.cssText = "display:inline-block;width:18px;height:2px;border-radius:1px;background:" + def.color;
+      item.appendChild(sw);
+      item.appendChild(document.createTextNode(def.label));
+      leg.appendChild(item);
+    });
+    wrap.appendChild(leg);
+  }
+
+  // ---- weekly status dashboard (static - not filter-dependent) ---------------
+  function renderStatusDash() {
+    if (!META.statusCounts) return;
+    var c = META.statusCounts;
+    var d = META.statusDeltas || {};
+    var wrap = $("statusDash");
+    wrap.textContent = "";
+
+    // goodDir: +1 means "more is good" (Done), -1 means "less is good" (bugs,
+    // To Do), 0 means neutral (In Progress).
+    var defs = [
+      { key: "toDo",       label: "To Do",       color: "var(--ts-todo)",    goodDir: -1 },
+      { key: "inProgress", label: "In Progress",  color: "var(--ts-doing)",   goodDir:  0 },
+      { key: "done",       label: "Done",          color: "var(--ts-done)",    goodDir:  1 },
+      { key: "bugs",       label: "Bugs",          color: "var(--st-serious)", goodDir: -1 }
+    ];
+
+    defs.forEach(function (def) {
+      var val   = c[def.key];
+      var delta = d[def.key];
+      var tile  = el("div", "tile");
+      tile.style.setProperty("--tile-color", def.color);
+      tile.appendChild(el("div", "value", fmt(val)));
+      tile.appendChild(el("div", "label", def.label));
+
+      var sub;
+      if (delta === null || delta === undefined) {
+        sub = el("div", "pct", "first run");
+      } else if (delta === 0) {
+        sub = el("div", "pct", "same as last week");
+      } else {
+        var sign   = delta > 0 ? "+" : "";
+        var isGood = def.goodDir === 0 ? false
+                   : (delta > 0 ? def.goodDir > 0 : def.goodDir < 0);
+        var isBad  = def.goodDir !== 0 && !isGood;
+        var cls    = "pct" + (isGood ? " delta-good" : isBad ? " delta-bad" : "");
+        sub = el("div", cls, sign + delta + " from last week");
+      }
+      tile.appendChild(sub);
       wrap.appendChild(tile);
     });
   }
@@ -1759,12 +2050,12 @@ try {
   function taskFlags(task) {
     var f = [];
     if (task.state !== "Done") {
-      if (task.discDays === -1 || task.discDays > 7)                              f.push("No comment");
       if (!task.targetOn)                                                          f.push("No target date");
       if (task.kind === "Scripting" && task.remWorkNew === null)                   f.push("No remaining work");
       if (task.kind === "Execution" && task.state === "In Progress" && task.exec === 0 && task.cases > 0) f.push("Execution not started");
       if ((task.kind === "Scripting" || task.kind === "Execution") && task.cases === 0) f.push("No cases linked");
     }
+    if (task.state === "Done" && task.kind === "Scripting" && task.cases > 0 && task.tcReady < task.cases) f.push("Not all TCs Ready");
     return f;
   }
 
@@ -1949,7 +2240,10 @@ try {
     var tb = el("tbody");
     groups.forEach(function (g) {
       var pbis = Object.keys(g.pbis).map(function (k) { return g.pbis[k]; })
-                       .sort(function (a, b) { return (a.product || "").localeCompare(b.product || ""); });
+                       .sort(function (a, b) {
+                         var p = (a.product || "").localeCompare(b.product || "");
+                         return p !== 0 ? p : (a.title || "").localeCompare(b.title || "");
+                       });
 
       // --- group (subtotal) row ---
       var sr = el("tr");
@@ -1999,6 +2293,17 @@ try {
           ast.style.cssText = "color:#c0392b;font-weight:700;";
           ast.title = "One or more tasks under this PBI have incomplete items";
           titleWrap.appendChild(ast);
+        }
+        if (p.id && META.tfsBase) {
+          var lnk = document.createElement("a");
+          lnk.href = META.tfsBase + p.id;
+          lnk.target = "_blank";
+          lnk.rel = "noopener";
+          lnk.className = "tfs-link";
+          lnk.title = "Open PBI " + p.id + " in TFS";
+          lnk.innerHTML = '<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M1 1h4v1H2v8h8V7h1v4H1V1zm5 0h4v4h-1V2.7L5.4 6.3l-.7-.7L8.3 2H6V1z"/></svg>';
+          lnk.addEventListener("click", function (e) { e.stopPropagation(); });
+          titleWrap.appendChild(lnk);
         }
         c.appendChild(titleWrap);
         if (p.id) c.appendChild(el("div", "meta-line", "PBI " + p.id));
@@ -2239,7 +2544,20 @@ try {
       if (flags.length) tr.className = "flag-row";
 
       var td = el("td");
-      td.appendChild(el("div", "tasktitle", task.title));
+      var titleWrap = el("div", "tasktitle");
+      titleWrap.appendChild(document.createTextNode(task.title));
+      if (META.tfsBase) {
+        var tLnk = document.createElement("a");
+        tLnk.href = META.tfsBase + task.id;
+        tLnk.target = "_blank";
+        tLnk.rel = "noopener";
+        tLnk.className = "tfs-link";
+        tLnk.title = "Open task " + task.id + " in TFS";
+        tLnk.innerHTML = '<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M1 1h4v1H2v8h8V7h1v4H1V1zm5 0h4v4h-1V2.7L5.4 6.3l-.7-.7L8.3 2H6V1z"/></svg>';
+        tLnk.addEventListener("click", function (e) { e.stopPropagation(); });
+        titleWrap.appendChild(tLnk);
+      }
+      td.appendChild(titleWrap);
       var meta = "#" + task.id;
       if (task.testers) meta += SEP + "tested by " + task.testers;
       td.appendChild(el("div", "meta-line", meta));
@@ -2277,7 +2595,7 @@ try {
       tr.appendChild(meterCell(task, task.state === "Done"));
 
       var discTd = el("td", "ctr");
-      if ((task.taskDisc && task.taskDisc.length) || (task.pbiDisc && task.pbiDisc.length)) {
+      if (task.taskDisc || task.pbiDisc) {
         var dBtn = document.createElement("button");
         dBtn.className = "disc-btn";
         dBtn.title = "View discussion";
@@ -2292,7 +2610,14 @@ try {
       tr.appendChild(discTd);
 
       var bugCount = task.bugIds ? task.bugIds.split(",").filter(Boolean).length : 0;
-      tr.appendChild(el("td", "num" + (bugCount ? "" : " muted"), fmt(bugCount)));
+      var bugTd = el("td", "num" + (bugCount ? "" : " muted"));
+      bugTd.appendChild(document.createTextNode(fmt(bugCount)));
+      if (task.bugDelta > 0) {
+        var dlt = el("span", "bug-delta", "+" + task.bugDelta);
+        dlt.title = task.bugDelta + " new bug" + (task.bugDelta > 1 ? "s" : "") + " since last report";
+        bugTd.appendChild(dlt);
+      }
+      tr.appendChild(bugTd);
 
       tr.appendChild(el("td", "num", fmt(task.cases)));
 
@@ -2445,6 +2770,8 @@ try {
 
   renderLegend();
   renderLoadLegend();
+  renderStatusChart();
+  renderStatusDash();
 
   $("fGroup").addEventListener("change",   function (e) { state.group = e.target.value; render(); });
   $("fText").addEventListener("input",     function (e) { state.text = e.target.value; render(); });
@@ -2516,9 +2843,10 @@ try {
     function section(who, discs) {
       var sec = el("div", "disc-section");
       sec.appendChild(el("div", "disc-who", who));
-      if (discs && discs.length) {
+      var discArr = discs ? (Array.isArray(discs) ? discs : [discs]) : [];
+      if (discArr.length) {
         // Newest first
-        var reversed = discs.slice().reverse();
+        var reversed = discArr.slice().reverse();
         reversed.forEach(function (disc) {
           if (!disc || !disc.html) return;
           var entry = el("div", "disc-entry");
@@ -2584,6 +2912,18 @@ try {
 
     $size = [math]::Round((Get-Item -LiteralPath $OutputPath).Length / 1KB, 1)
     Write-Host ("Wrote {0} ({1} KB)" -f $OutputPath, $size)
+
+    # Persist current bug counts for next run's delta detection.
+    $newCounts = [ordered]@{}
+    foreach ($t in $tasks) {
+        $newCounts[$t.id] = if ($t.bugIds) { ($t.bugIds -split ',').Count } else { 0 }
+    }
+    $newCounts | ConvertTo-Json -Compress | Set-Content -LiteralPath $bugCountsPrevPath -Encoding UTF8
+    Write-Host ("Bug counts snapshot written ({0} tasks)" -f $newCounts.Count)
+
+    # Persist rolling status history for the trend chart and delta tiles.
+    $updatedHistory | ConvertTo-Json -Compress | Set-Content -LiteralPath $statusHistPath -Encoding UTF8
+    Write-Host ("Status history written ({0} week(s))" -f $updatedHistory.Count)
 
     if ($Show) { Start-Process $OutputPath }
 }
