@@ -68,6 +68,10 @@ The batch runs scripts in this order: **1 → 2 → 3 → 8 → 9 → 10 → 11 
 - `csv\workitem_remwork_history.csv`
 - `csv\workitem_tc_state_history.csv`
 
+**Rolling state files** — also committed, but not point-in-time snapshots; they accumulate across runs:
+- `csv\status_counts_history.json` — up to 12 weeks of task-state counts, keyed to the Tuesday of each run week. Feeds the weekly trend chart and per-person slicing in the HTML report. Script 7 reads it, appends the current week's entry (anchored to Tuesday), and writes it back each run.
+- `csv\bug_counts_prev.json` — single-week snapshot of bug counts from the previous run. Used to compute the bug-delta tile. Written by script 7 after each run.
+
 The derived CSVs and `weekly_meeting_report.html` are `.gitignore`d — regenerate rather than trusting a stale copy.
 
 Scripts 1, 2, 3, 8, 9, 10, and 11 share one auth mechanism: PAT lookup order is `-Pat` arg → DPAPI cache at `%LOCALAPPDATA%\AdoTestPlanExtractor\pat.dat` → `$env:AZURE_DEVOPS_PAT` → prompt. **Press Enter at the prompt to use Windows auth** (the normal path for the on-prem server). Clear a stale PAT with `-ResetPat`. Scripts 10 and 11 accept `-Pat` and `-ApiVersion` but do not expose `-ResetPat`.
@@ -93,6 +97,7 @@ This is the most complex script — it generates a self-contained HTML/JS dashbo
 - Discussion data: `$commentsByItem` (work item ID → latest comment) from `workitem_comments.csv`. Each task gets `taskDisc` and `pbiDisc` objects, plus `discDays` (days since latest comment).
 - Remaining Work history: `$remWorkByTask` (Task ID → latest old→new revision) from `workitem_remwork_history.csv`. Used to show scripting task progress as "Xh → Yh". Missing file is non-fatal.
 - TC state history: `$tcStateHistByTc` (Test Case ID → latest old→new state change) from `workitem_tc_state_history.csv`. Per-task aggregation produces `tcToReady`, `tcToDesign`, and `tcStateChangeDays` fields in the JSON payload. Missing file is non-fatal. `tcStateChangeDays` uses -1 as sentinel (consistent with `discDays`) and feeds the `w7`/`w14` activity filters via the existing `withinDays()` guard.
+- Rolling history: reads `csv\status_counts_history.json` (up to 12 entries), appends this week's entry keyed to the Tuesday anchor date, and writes it back. Reads `csv\bug_counts_prev.json` for the bug-delta tile, then overwrites it with current counts. Both files are committed to git.
 - Serializes everything to JSON, embeds in `<script id="payload" type="application/json">` in the HTML
 
 **Data flow (JavaScript side):**

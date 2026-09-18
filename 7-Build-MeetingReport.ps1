@@ -717,15 +717,23 @@ try {
     $execTotal = ($tasks | Measure-Object -Property exec -Sum).Sum
     Write-Host ("Aggregated to {0} tasks; {1} test-plan-sourced test points" -f $tasks.Count, $execTotal)
 
-    # --- Week-over-week task-state and bug counts. Loaded at the top alongside
-    # --- bug_counts_prev.json; written at the end so the next run can show
-    # --- deltas. Uses $tasks, so must run after the aggregation loop.
-    $cntToDo  = @($tasks | Where-Object { $_.state -eq 'To Do' }).Count
-    $cntInPrg = @($tasks | Where-Object { $_.state -eq 'In Progress' }).Count
-    $cntDone  = @($tasks | Where-Object { $_.state -eq 'Done' }).Count
-    $cntBugs  = [int]($tasks | ForEach-Object {
-        if ($_.bugIds) { ($_.bugIds -split ',').Count } else { 0 }
-    } | Measure-Object -Sum).Sum
+    # --- Weekly activity counts (not cumulative totals).
+    # --- toDo/inProgress = tasks in that state touched this week (changedDays <= 7).
+    # --- done            = tasks closed this week (closedDays <= 7).
+    # --- cntBugs         = current total bugs (used to compute weekly new-bug delta).
+    $weeklyToDo  = @($tasks | Where-Object { $_.state -eq 'To Do'       -and $_.changedDays -ge 0 -and $_.changedDays -le 7 }).Count
+    $weeklyInPrg = @($tasks | Where-Object { $_.state -eq 'In Progress' -and $_.changedDays -ge 0 -and $_.changedDays -le 7 }).Count
+    $weeklyDone  = @($tasks | Where-Object { $_.closedDays -ge 0 -and $_.closedDays -le 7 }).Count
+    $allBugIdSet = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($t in $tasks) {
+        if ($t.bugIds) { foreach ($b in ($t.bugIds -split ',')) { [void]$allBugIdSet.Add($b) } }
+    }
+    $cntBugs = $allBugIdSet.Count
+    # New bugs this week = current total minus the previous week's total (floor 0).
+    $prevTotalBugs = if ($statusPrev -and $null -ne $statusPrev.totalBugs) { [int]$statusPrev.totalBugs } `
+                     elseif ($statusPrev -and $null -ne $statusPrev.bugs)   { [int]$statusPrev.bugs }     `
+                     else { $cntBugs }
+    $weeklyBugs = [math]::Max(0, $cntBugs - $prevTotalBugs)
 
     function Get-StatusDelta([int]$cur, $prev, [string]$key) {
         if ($null -eq $prev) { return $null }
@@ -734,12 +742,63 @@ try {
         return $cur - [int]$p
     }
 
-    # Build updated history: dedup by date, append today, cap at 12.
+    # Anchor history entries to the closing Tuesday of the current week.
+    # Tuesday is the week-close, so mid-week runs key forward to the coming Tuesday
+    # rather than backward to the past one. DayOfWeek: Sun=0, Mon=1, Tue=2, ..., Sat=6.
+    $daysToNextTuesday = (2 - [int]$AsOf.DayOfWeek + 7) % 7   # 0 when today IS Tuesday
+    $weekTuesdayDate   = $AsOf.AddDays($daysToNextTuesday).Date
+    $weekTuesdayStr    = $weekTuesdayDate.ToString('yyyy-MM-dd')
+    # Days elapsed since the previous Tuesday (for retroactive window math).
+    $daysSincePrevTue  = if ($daysToNextTuesday -eq 0) { 7 } else { 7 - $daysToNextTuesday }
+
+    # Retroactive seeding: when no history exists, approximate prior-week counts
+    # from changedDays/closedDays windows anchored to Tuesday boundaries.
+    # Week N-back runs from Tuesday N*7 days ago to the Tuesday (N-1)*7 days ago.
+    # changedDays window: [daysSincePrevTue+(N-1)*7+1 .. daysSincePrevTue+N*7].
+    # Bugs delta is omitted for retroactive entries (no prior snapshot to diff).
+    if ($statusHistory.Count -eq 0) {
+        for ($wb = 3; $wb -ge 1; $wb--) {
+            $winStart = $daysSincePrevTue + ($wb - 1) * 7 + 1
+            $winEnd   = $daysSincePrevTue + $wb * 7
+            $seedDate = $weekTuesdayDate.AddDays(-($wb * 7)).ToString('yyyy-MM-dd')
+            $sToDo  = @($tasks | Where-Object { $_.state -eq 'To Do'       -and $_.changedDays -ge $winStart -and $_.changedDays -le $winEnd }).Count
+            $sInPrg = @($tasks | Where-Object { $_.state -eq 'In Progress' -and $_.changedDays -ge $winStart -and $_.changedDays -le $winEnd }).Count
+            $sDone  = @($tasks | Where-Object { $_.closedDays -ge $winStart -and $_.closedDays -le $winEnd }).Count
+            $statusHistory.Add([pscustomobject]@{ date=$seedDate; toDo=$sToDo; inProgress=$sInPrg; done=$sDone; bugs=0; totalBugs=$cntBugs })
+            Write-Host ("Retroactive seed: {0}  ToDo={1}  InPrg={2}  Done={3}" -f $seedDate, $sToDo, $sInPrg, $sDone)
+        }
+    }
+
+    # Build updated history: dedup by Tuesday date, append this week's entry, cap at 12.
     $asOfStr = $AsOf.ToString('yyyy-MM-dd')
+
+    # Per-person weekly breakdown for filtered chart and tile deltas.
+    $byPerson = @{}
+    $byPersonBugSets = @{}
+    foreach ($t in $tasks) {
+        $name = $t.assignee
+        if (-not $byPerson.ContainsKey($name)) {
+            $byPerson[$name] = [pscustomobject]@{ toDo=0; inProgress=0; done=0; totalBugs=0 }
+            $byPersonBugSets[$name] = [System.Collections.Generic.HashSet[string]]::new()
+        }
+        if ($t.state -eq 'To Do'       -and $t.changedDays -ge 0 -and $t.changedDays -le 7) { $byPerson[$name].toDo++ }
+        if ($t.state -eq 'In Progress' -and $t.changedDays -ge 0 -and $t.changedDays -le 7) { $byPerson[$name].inProgress++ }
+        if ($t.closedDays -ge 0 -and $t.closedDays -le 7)                                   { $byPerson[$name].done++ }
+        if ($t.bugIds) { foreach ($b in ($t.bugIds -split ',')) { [void]$byPersonBugSets[$name].Add($b) } }
+    }
+    foreach ($pName in @($byPerson.Keys)) { $byPerson[$pName].totalBugs = $byPersonBugSets[$pName].Count }
+
+    # Same-week dedup: any existing entry for this Tuesday key is removed before
+    # appending the fresh one, so re-pulls within the week update rather than grow.
     $updatedHistory = [System.Collections.Generic.List[object]]::new()
-    foreach ($e in @($statusHistory | Where-Object { $_.date -ne $asOfStr })) { $updatedHistory.Add($e) }
-    $updatedHistory.Add([pscustomobject]@{ date=$asOfStr; toDo=$cntToDo; inProgress=$cntInPrg; done=$cntDone; bugs=$cntBugs })
+    foreach ($e in @($statusHistory)) {
+        if ($e.date -eq $weekTuesdayStr) { continue }
+        $updatedHistory.Add($e)
+    }
+    $updatedHistory.Add([pscustomobject]@{ date=$weekTuesdayStr; toDo=$weeklyToDo; inProgress=$weeklyInPrg; done=$weeklyDone; bugs=$weeklyBugs; totalBugs=$cntBugs; byPerson=$byPerson })
     while ($updatedHistory.Count -gt 12) { $updatedHistory.RemoveAt(0) }
+
+    Write-Host ("Status history: keyed to Tuesday {0} ({1} week(s) total)" -f $weekTuesdayStr, $updatedHistory.Count)
 
     # Built from char codes so this script file contains no non-ASCII bytes at
     # all. ConvertTo-Json emits them as \uXXXX escapes, so the generated HTML is
@@ -778,23 +837,23 @@ try {
             bugUnreadable = [int]$bugUnreadable
             tfsBase       = 'https://tfs.deltek.com/tfs/Deltek/QEAutomation/_workitems/edit/'
             statusCounts = [pscustomobject]@{
-                toDo       = $cntToDo
-                inProgress = $cntInPrg
-                done       = $cntDone
-                bugs       = $cntBugs
+                toDo       = $weeklyToDo
+                inProgress = $weeklyInPrg
+                done       = $weeklyDone
+                bugs       = $weeklyBugs
+                totalBugs  = $cntBugs
             }
             statusDeltas = [pscustomobject]@{
-                toDo       = (Get-StatusDelta $cntToDo  $statusPrev 'toDo')
-                inProgress = (Get-StatusDelta $cntInPrg $statusPrev 'inProgress')
-                done       = (Get-StatusDelta $cntDone  $statusPrev 'done')
-                bugs       = (Get-StatusDelta $cntBugs  $statusPrev 'bugs')
+                toDo       = (Get-StatusDelta $weeklyToDo  $statusPrev 'toDo')
+                inProgress = (Get-StatusDelta $weeklyInPrg $statusPrev 'inProgress')
+                done       = (Get-StatusDelta $weeklyDone  $statusPrev 'done')
             }
             statusHistory = @($updatedHistory)
         }
         tasks = $tasks
     }
 
-    $json = $payload | ConvertTo-Json -Depth 6 -Compress
+    $json = $payload | ConvertTo-Json -Depth 10 -Compress
     # Escape every '<' as its JSON unicode form. No '<' appears in JSON outside
     # string literals, so a blanket replace is safe, and it stops a task title
     # containing "</script>" from breaking out of the embedded data block.
@@ -898,13 +957,13 @@ try {
   .tc-design { color: var(--ink-muted); }
   .tc-sep    { margin: 0 0.5em; color: var(--ink-muted); }
 
-  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 30px; }
-  header > div { flex: 1; min-width: 0; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
   button {
     font: inherit; color: var(--ink); background: var(--surface);
     border: 1px solid var(--border); border-radius: 6px;
     padding: 6px 11px; cursor: pointer; min-height: 32px;
   }
+  .icon-btn[aria-pressed="true"] { background: rgba(59,130,246,.14); border-color: #3b82f6; color: #3b82f6; }
   button:hover { background: var(--plane); }
   button[aria-pressed="true"] { border-color: var(--ink-muted); font-weight: 600; }
 
@@ -918,59 +977,53 @@ try {
      themselves on the left, the scope readout is pinned right. Previously
      everything shared one wrapping flex, so the readout was just another item
      and dropped to a second line as soon as the controls filled the width. */
-  .filters { display: flex; flex-wrap: nowrap; gap: 16px; align-items: flex-end; }
+  .filters { display: flex; flex-wrap: nowrap; gap: 12px; align-items: center; }
   .filter-controls {
-    display: flex; flex-wrap: wrap; gap: 12px 14px; align-items: flex-end;
+    display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center;
     flex: 1 1 auto; min-width: 0;
   }
 
-  /* Pinned to the top so the controls stay reachable while reading rows far
-     down the page - change a filter and watch the table update without
-     scrolling back. z-index sits below #tip (50) so chart tooltips still draw
-     over it, and above ordinary content so rows pass underneath.
-     The solid surface is load-bearing: without it, scrolling rows would show
-     through the bar. */
+  /* Sticky filter strip — floating pill bar look. Solid surface prevents
+     scrolling content from showing through; shadow is subtle (not heavy). */
   .card.filters {
-    position: sticky;
-    top: 0;
-    z-index: 30;
-    background: var(--grid);
-    border-color: var(--axis);
-    box-shadow: 0 4px 20px rgba(0,0,0,.38);
+    position: sticky; top: 0; z-index: 30;
+    background: var(--surface);
+    border-color: var(--rule);
+    border-top: none;
+    border-radius: 0 0 10px 10px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.10);
+    padding: 10px 14px;
   }
-  /* Fills the body's top padding, so nothing is briefly visible above the bar
-     as it pins. The pseudo-element always matches the page background, not the
-     bar background, so it stays invisible as content scrolls under it. */
-  .card.filters::before {
-    content: ""; position: absolute; left: -1px; right: -1px;
-    top: -26px; height: 26px; background: var(--plane);
-  }
-  .filter-controls > label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
+  /* Hide the text label above each control — the placeholder text inside the
+     control already identifies it, so the label is visual noise. The <label>
+     element is kept for screen-reader association. */
+  .filter-controls > label { display: contents; font-size: 0; }
+
+  /* Base form controls — scoped to filter bar so chart-section selects are unaffected. */
   select, input[type="search"] {
     font: inherit; color: var(--ink); background: var(--surface);
     border: 1px solid var(--border); border-radius: 6px;
     padding: 6px 8px; min-height: 32px; min-width: 150px;
   }
-  /* Right-hand readout. Allowed to use two short lines rather than one long
-     one - stacking inside its own column is what keeps it off a row of its own. */
+  .filter-controls select, .filter-controls input[type="search"] {
+    background: var(--plane); border-color: var(--rule); border-radius: 20px;
+    padding: 3px 12px; min-height: 28px; min-width: 120px; font-size: 12px;
+  }
   .scope {
     flex: 0 0 auto; font-size: 12px; color: var(--ink-2);
-    text-align: right; line-height: 1.45; padding-bottom: 4px; white-space: nowrap;
+    text-align: right; line-height: 1.45; white-space: nowrap;
   }
-  /* Multi-select checkbox dropdown widget used by the filter bar.
-     Chart-section selects (fGroup, fLoadGroup, fLoadColor) keep the base
-     select style above and are not affected by any of these rules. */
+  /* Multi-select checkbox dropdown — pill style. */
   .multi-sel { position: relative; display: inline-block; }
   .multi-btn {
-    font: inherit; color: var(--ink); background: var(--surface);
-    border: 1px solid var(--border); border-radius: 6px;
-    padding: 6px 28px 6px 8px; min-height: 32px; min-width: 150px; max-width: 172px;
+    font: inherit; font-size: 12px; color: var(--ink); background: var(--plane);
+    border: 1px solid var(--rule); border-radius: 20px;
+    padding: 3px 26px 3px 12px; min-height: 28px; min-width: 110px; max-width: 160px;
     cursor: pointer; text-align: left; position: relative;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  /* \25BE = small down-pointing triangle (ASCII-safe in a PS1 file). */
   .multi-btn::after {
-    content: "\25BE"; position: absolute; right: 8px; top: 50%;
+    content: "\25BE"; position: absolute; right: 10px; top: 50%;
     transform: translateY(-50%); font-size: 10px; color: var(--ink-2); pointer-events: none;
   }
   .multi-panel {
@@ -1012,6 +1065,12 @@ try {
   .tile .pct { font-size: 11.5px; color: var(--ink-muted); }
   .delta-good { color: var(--st-good); font-weight: 600; }
   .delta-bad  { color: var(--st-critical); font-weight: 600; }
+  /* Status tiles: 2x2 grid beside the chart */
+  #statusDash { display: grid; grid-template-columns: 1fr 1fr; width: 280px; flex-shrink: 0; gap: 20px 8px; align-content: center; }
+  #statusDash .tile { flex: none; min-width: 0; }
+  #statusDash .tile .value { font-size: 20px; }
+  #statusDash .tile .label { font-size: 11px; }
+  #statusDash .tile .pct   { font-size: 10px; }
   /* Status colour never carries meaning alone - it always ships with this
      glyph and the text label beside it. */
   .glyph {
@@ -1182,10 +1241,49 @@ try {
 
   footer { margin-top: 26px; font-size: 12px; color: var(--ink-muted); line-height: 1.7; }
 
+  /* Minimalistic icon buttons in the header toolbar */
+  .icon-btn {
+    background: none; border: 1px solid transparent; cursor: pointer;
+    width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;
+    border-radius: 7px; color: var(--ink-2); padding: 0; position: relative; flex: 0 0 34px;
+  }
+  .icon-btn:hover { background: var(--surface-2); border-color: var(--rule); }
+  .icon-btn svg { width: 18px; height: 18px; stroke: currentColor; fill: none;
+    stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; display: block; }
+  .icon-badge {
+    position: absolute; top: -3px; right: -3px;
+    background: #ef4444; color: #fff; font-size: 9px; font-weight: 700;
+    min-width: 15px; height: 15px; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    padding: 0 3px; line-height: 1; pointer-events: none;
+  }
+  /* Activity drawer */
+  #activityDrawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(420px, 95vw);
+    background: var(--surface); box-shadow: -4px 0 28px rgba(0,0,0,.18);
+    z-index: 60; transform: translateX(100%); transition: transform .22s ease;
+    overflow-y: auto; padding: 24px 20px;
+    border-left: 1px solid var(--rule);
+  }
+  #activityDrawer.open { transform: translateX(0); }
+  #drawerOverlay {
+    display: none; position: fixed; inset: 0; z-index: 59;
+    background: rgba(0,0,0,.25);
+  }
+  #drawerOverlay.open { display: block; }
+  /* Exceptions popover */
+  #exceptPopover {
+    display: none; position: fixed; z-index: 55;
+    background: var(--surface); border: 1px solid var(--rule);
+    border-radius: 8px; padding: 12px 14px; max-width: 340px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.14); font-size: 13px; line-height: 1.5;
+  }
+  #exceptPopover.open { display: block; }
+
   @media print {
     body { background: #fff; padding: 0; }
     .card { break-inside: avoid; border-color: #ccc; }
-    .filters, #themeBtn, #tableBtn, #tip { display: none !important; }
+    .filters, header, #tableBtn, #tip, #activityDrawer, #drawerOverlay, #exceptPopover { display: none !important; }
   }
 
 
@@ -1194,12 +1292,22 @@ try {
 <body>
 
 <header>
-  <div>
-    <h1>Performance Testing - Weekly Meeting Report</h1>
-    <p class="sub">Active work by person, and execution results from test plans.
-       <span class="muted">Generated <span id="genAt"></span></span></p>
+  <h1 style="margin:0;flex:1;min-width:0;font-size:16px;font-weight:600">
+    Performance Testing &mdash; Weekly Meeting Report
+    <span class="muted" style="font-size:11px;font-weight:400;margin-left:10px;white-space:nowrap">Generated <span id="genAt"></span></span>
+  </h1>
+  <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
+    <button id="exceptBtn" class="icon-btn" type="button" title="Link exceptions" hidden>
+      <svg viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span class="icon-badge" id="exceptBadge"></span>
+    </button>
+    <button id="activityBtn" class="icon-btn" type="button" title="Activity">
+      <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+    </button>
+    <button id="themeBtn" class="icon-btn" type="button" title="Switch light / dark">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+    </button>
   </div>
-  <button id="themeBtn" type="button" title="Switch light / dark">Theme</button>
 </header>
 
 <div class="card filters" role="group" aria-label="Filters">
@@ -1218,9 +1326,9 @@ try {
   </label>
   <label>Task state
     <div class="multi-sel" id="fState">
-      <button class="multi-btn" type="button" aria-haspopup="true" aria-expanded="false"><span class="multi-label">3 selected</span></button>
+      <button class="multi-btn" type="button" aria-haspopup="true" aria-expanded="false"><span class="multi-label">2 selected</span></button>
       <div class="multi-panel" hidden>
-        <label class="cb-item"><input type="checkbox" value="To Do" checked><span>To Do</span></label>
+        <label class="cb-item"><input type="checkbox" value="To Do"><span>To Do</span></label>
         <label class="cb-item"><input type="checkbox" value="In Progress" checked><span>In Progress</span></label>
         <label class="cb-item"><input type="checkbox" value="Done" checked><span>Done</span></label>
       </div>
@@ -1252,26 +1360,41 @@ try {
   <label>Search
     <input id="fText" type="search" placeholder="task, PBI, product...">
   </label>
-  <button id="fReset" type="button">Reset</button>
+  <button id="fReset" class="icon-btn" type="button" title="Reset filters">
+    <svg viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3"/></svg>
+  </button>
  </div>
  <div class="scope" id="scopeNote"></div>
 </div>
 
-<div class="card">
-  <h2>Activity <span class="muted" style="font-weight:400">- what moved, as of <span id="asOf"></span></span></h2>
+<!-- Activity slide-in drawer (toggled by #activityBtn in header) -->
+<div id="drawerOverlay"></div>
+<div id="activityDrawer" role="dialog" aria-label="Activity">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+    <h2 style="margin:0">Activity <span class="muted" style="font-weight:400;font-size:14px">as of <span id="asOf"></span></span></h2>
+    <button id="drawerClose" class="icon-btn" type="button" title="Close">
+      <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
   <p class="sub" style="margin-bottom:14px">All filters apply, including task state.</p>
   <div class="kpis" id="activity"></div>
 </div>
 
-<div id="mistakeBanner" class="banner hidden" style="margin-bottom:16px">
+<!-- Exceptions popover (anchored near #exceptBtn) -->
+<div id="exceptPopover">
   <strong id="mistakeCount"></strong>
-  <span>link(s) in scope use a <code>Child</code> relationship where <code>Tests</code> is required, so they are missing from ADO traceability. See <code>exceptions_weekly.csv</code>.</span>
+  <span> link(s) use a <code>Child</code> relationship where <code>Tests</code> is required, missing from ADO traceability. See <code>exceptions_weekly.csv</code>.</span>
 </div>
 
 <div class="card" style="margin-bottom:16px">
-  <h2 style="margin-bottom:12px">Weekly Status</h2>
-  <div id="statusChart" style="margin-bottom:16px"></div>
-  <div class="kpis" id="statusDash"></div>
+  <div style="display:flex;gap:20px;align-items:baseline;margin-bottom:10px">
+    <h2 style="margin:0;flex:1;min-width:0">Weekly Status</h2>
+    <span id="statusScope" style="width:280px;flex-shrink:0;text-align:center;font-size:14px;font-weight:600;color:var(--ink-2)"></span>
+  </div>
+  <div style="display:flex;gap:20px;align-items:center">
+    <div id="statusChart" style="flex:1;min-width:0"></div>
+    <div class="kpis" id="statusDash"></div>
+  </div>
 </div>
 
 <div class="card">
@@ -1293,7 +1416,9 @@ try {
           <option value="urgency" selected>Time to target</option>
         </select>
       </label>
-      <button id="loadTableBtn" type="button" aria-pressed="false">Table view</button>
+      <button id="loadTableBtn" class="icon-btn" type="button" aria-pressed="false" title="Table view">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="9" x2="9" y2="21"/></svg>
+      </button>
     </div>
   </div>
   <ul class="legend" id="loadLegend"></ul>
@@ -1310,7 +1435,9 @@ try {
 <div class="card">
   <div class="card-head">
     <h2>Execution results <span class="muted" style="font-weight:400">- test points that came from a test plan</span></h2>
-    <button id="kpisToggle" class="collapse-btn" type="button" aria-expanded="false">Show</button>
+    <button id="kpisToggle" class="icon-btn" type="button" aria-expanded="false" title="Show / hide">
+      <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+    </button>
   </div>
   <div id="kpisBody" hidden>
     <p class="sub" style="margin-bottom:14px">Scripting tasks are excluded here: they link test cases directly, which would double-count the same results.</p>
@@ -1332,8 +1459,12 @@ try {
           <option value="state">Task state</option>
         </select>
       </label>
-      <button id="tableBtn" type="button" aria-pressed="false">Table view</button>
-      <button id="chartToggle" class="collapse-btn" type="button" aria-expanded="false">Show</button>
+      <button id="tableBtn" class="icon-btn" type="button" aria-pressed="false" title="Table view">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="9" x2="9" y2="21"/></svg>
+      </button>
+      <button id="chartToggle" class="icon-btn" type="button" aria-expanded="false" title="Show / hide">
+        <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
     </div>
   </div>
   <div id="chartBody" hidden>
@@ -1477,7 +1608,7 @@ try {
                 activityRange: { start: "", end: "" },
                 group: "assignee", tableView: false, sortKey: "exec", sortDir: -1,
                 loadGroup: "assignee", loadColor: "urgency", loadTableView: false,
-                selectedPbiKey: null, colFilters: {} };
+                selectedPbiKey: null, _tableAutoSelected: false, colFilters: {} };
 
   // changedDays / closedDays are -1 when the date is absent, so a plain
   // "<= 7" test would wrongly match those. Always require >= 0 first.
@@ -1501,8 +1632,8 @@ try {
   }
 
   var ACTIVITY = {
-    w7:  function (t) { return withinDays(t.changedDays, 7)  || withinDays(t.discDays, 7)  || (t.state !== "Done" && withinDays(t.tcStateChangeDays, 7));  },
-    w14: function (t) { return withinDays(t.changedDays, 14) || withinDays(t.discDays, 14) || (t.state !== "Done" && withinDays(t.tcStateChangeDays, 14)); },
+    w7:  function (t) { var d = t.state === "Done" ? t.closedDays : t.changedDays; return withinDays(d, 7)  || withinDays(t.discDays, 7)  || (t.state !== "Done" && withinDays(t.tcStateChangeDays, 7));  },
+    w14: function (t) { var d = t.state === "Done" ? t.closedDays : t.changedDays; return withinDays(d, 14) || withinDays(t.discDays, 14) || (t.state !== "Done" && withinDays(t.tcStateChangeDays, 14)); },
     c7:  function (t) { return withinDays(t.closedDays, 7); },
     c30: function (t) { return withinDays(t.closedDays, 30); },
     // ISO string comparison works for YYYY-MM-DD dates (lexicographic = chronological).
@@ -1532,7 +1663,7 @@ try {
       if (state.product.size && !state.product.has(t.product))  return false;
       if (!opts.ignoreState  && state.state.size && !state.state.has(t.state)) return false;
       if (state.kind.size    && !state.kind.has(t.kind))         return false;
-      if (state.activity.size) {
+      if (!opts.ignoreActivity && state.activity.size) {
         var actPass = false;
         state.activity.forEach(function (a) { if (ACTIVITY[a] && ACTIVITY[a](t)) actPass = true; });
         if (!actPass) return false;
@@ -1652,8 +1783,8 @@ try {
   function renderStatusChart() {
     var wrap = $("statusChart");
     wrap.textContent = "";
-    var history = META.statusHistory;
-    if (!history || history.length < 1) {
+    var rawHistory = META.statusHistory;
+    if (!rawHistory || rawHistory.length < 1) {
       var msg = el("p", "muted");
       msg.style.cssText = "font-size:12px;margin:0";
       msg.textContent = "Trend chart appears after the first weekly run.";
@@ -1661,15 +1792,27 @@ try {
       return;
     }
 
+    // When exactly one person is selected, slice history through that person's
+    // byPerson bucket. Falls back to team totals for any week that predates the
+    // per-person data (old history entries won't have byPerson).
+    var selPerson = (state.person.size === 1) ? Array.from(state.person)[0] : null;
+    var history = rawHistory.map(function (r) {
+      if (!selPerson) return r;
+      var p = r.byPerson && r.byPerson[selPerson];
+      return p ? { date: r.date, toDo: p.toDo || 0, inProgress: p.inProgress || 0, done: p.done || 0, bugs: p.totalBugs || 0 }
+               : { date: r.date, toDo: 0, inProgress: 0, done: 0, bugs: 0 };
+    });
+
     var LINES = [
       { key: "done",       label: "Done",        color: "#22c55e", dash: ""    },
-      { key: "inProgress", label: "In Progress",  color: "#3b82f6", dash: "5,3" },
-      { key: "toDo",       label: "To Do",        color: "#f97316", dash: "4,2" },
+      { key: "inProgress", label: "In Progress",  color: "#f59e0b", dash: "5,3" },
+      { key: "toDo",       label: "To Do",        color: "#3b82f6", dash: "4,2" },
       { key: "bugs",       label: "Bugs",          color: "#ef4444", dash: "2,2" }
     ];
 
-    var W = 560, H = 160;
-    var PAD = { top: 14, right: 12, bottom: 30, left: 34 };
+    var W = Math.max(200, wrap.offsetWidth || 560);
+    var H = 220;
+    var PAD = { top: 22, right: 16, bottom: 30, left: 34 };
     var iW  = W - PAD.left - PAD.right;
     var iH  = H - PAD.top  - PAD.bottom;
     var n   = history.length;
@@ -1694,6 +1837,22 @@ try {
     svg.style.overflow = "visible";
     svg.style.display  = "block";
 
+    // Highlight band for the current week (last history entry).
+    var curX     = xPos(n - 1);
+    var bandHalf = Math.min(n < 2 ? iW / 2 : iW / (n - 1) / 2, 22);
+    svg.appendChild(svgEl("rect", {
+      x: curX - bandHalf, y: PAD.top - 8,
+      width: bandHalf * 2, height: iH + 8,
+      fill: "rgba(196,0,255,0.12)", rx: 3
+    }));
+    // "Now" label above the band.
+    var nowLbl = document.createElementNS(NS, "text");
+    nowLbl.setAttribute("x", curX); nowLbl.setAttribute("y", PAD.top - 11);
+    nowLbl.setAttribute("text-anchor", "middle"); nowLbl.setAttribute("font-size", "9");
+    nowLbl.setAttribute("font-weight", "600"); nowLbl.setAttribute("fill", "#c400ff");
+    nowLbl.textContent = "Current";
+    svg.appendChild(nowLbl);
+
     // Y gridlines + labels (4 steps)
     var steps = 4;
     for (var s = 0; s <= steps; s++) {
@@ -1708,12 +1867,14 @@ try {
       svg.appendChild(lbl);
     }
 
-    // X axis date labels
+    // X axis date labels — current week (last entry) is bold + blue.
     history.forEach(function (r, i) {
+      var isCur = (i === n - 1);
       var lbl = document.createElementNS(NS, "text");
       lbl.setAttribute("x", xPos(i)); lbl.setAttribute("y", PAD.top + iH + 16);
       lbl.setAttribute("text-anchor", "middle"); lbl.setAttribute("font-size", "10");
-      lbl.setAttribute("fill", "var(--ink-muted)");
+      lbl.setAttribute("fill", isCur ? "#c400ff" : "var(--ink-muted)");
+      if (isCur) lbl.setAttribute("font-weight", "600");
       lbl.textContent = (r.date || "").slice(5); // MM-DD
       svg.appendChild(lbl);
     });
@@ -1737,61 +1898,99 @@ try {
     });
 
     wrap.appendChild(svg);
-
-    // Inline legend
-    var leg = el("div");
-    leg.style.cssText = "display:flex;gap:14px;flex-wrap:wrap;margin-top:6px;font-size:11.5px";
-    LINES.forEach(function (def) {
-      var item = el("span");
-      item.style.cssText = "display:inline-flex;align-items:center;gap:5px;color:var(--ink-2)";
-      var sw = document.createElement("span");
-      sw.style.cssText = "display:inline-block;width:18px;height:2px;border-radius:1px;background:" + def.color;
-      item.appendChild(sw);
-      item.appendChild(document.createTextNode(def.label));
-      leg.appendChild(item);
-    });
-    wrap.appendChild(leg);
   }
 
-  // ---- weekly status dashboard (static - not filter-dependent) ---------------
+  // ---- weekly status dashboard (filter-responsive) ---------------------------
   function renderStatusDash() {
-    if (!META.statusCounts) return;
-    var c = META.statusCounts;
-    var d = META.statusDeltas || {};
     var wrap = $("statusDash");
     wrap.textContent = "";
 
-    // goodDir: +1 means "more is good" (Done), -1 means "less is good" (bugs,
-    // To Do), 0 means neutral (In Progress).
+    // Base set: person/product/kind filtered but ignoring state and activity
+    // filters so all three state tiles are always meaningful simultaneously.
+    var allRows = visible({ ignoreState: true, ignoreActivity: true });
+
+    // Weekly counts (live, filter-aware) using the same ACTIVITY functions
+    // as the Activity section - w7 = state-changed/commented in last 7 days,
+    // c7 = task closed in last 7 days.
+    var toDo = 0, inPrg = 0, done = 0;
+    var bugIdSet = new Set();
+    allRows.forEach(function (t) {
+      if (t.state === "To Do"       && ACTIVITY.w7(t)) toDo++;
+      if (t.state === "In Progress" && ACTIVITY.w7(t)) inPrg++;
+      if (ACTIVITY.c7(t))                               done++;
+      if (t.bugIds) t.bugIds.split(",").filter(Boolean).forEach(function(b) { bugIdSet.add(b); });
+    });
+    var totalBugs = bugIdSet.size;
+
+    // Total counts for sub-lines (all states, no activity filter).
+    var totToDo = allRows.filter(function (t) { return t.state === "To Do"; }).length;
+    var totInPrg = allRows.filter(function (t) { return t.state === "In Progress"; }).length;
+    var totDone  = allRows.filter(function (t) { return t.state === "Done"; }).length;
+
+    // New bugs this week.
+    var selPerson = state.person.size === 1 ? Array.from(state.person)[0] : null;
+    var noFilter  = !state.person.size && !state.product.size && !state.kind.size;
+    $("statusScope").textContent = selPerson ? selPerson : "Team";
+    var newBugs = 0;
+    if (noFilter) {
+      newBugs = META.statusCounts ? (META.statusCounts.bugs || 0) : 0;
+    } else if (selPerson && META.statusHistory && META.statusHistory.length >= 2) {
+      var prevH = META.statusHistory[META.statusHistory.length - 2];
+      var prevP = prevH.byPerson && prevH.byPerson[selPerson];
+      newBugs = prevP ? Math.max(0, totalBugs - (prevP.totalBugs || prevP.bugs || 0)) : 0;
+    }
+
+    // Week-over-week deltas for the weekly counts.
+    var d = {};
+    if (noFilter) {
+      d = META.statusDeltas || {};
+    } else if (selPerson && META.statusHistory && META.statusHistory.length >= 2) {
+      var ph = META.statusHistory[META.statusHistory.length - 2];
+      var pp = ph.byPerson && ph.byPerson[selPerson];
+      if (pp) {
+        d = {
+          toDo:       toDo - (pp.toDo       || 0),
+          inProgress: inPrg - (pp.inProgress || 0),
+          done:       done  - (pp.done       || 0)
+        };
+      }
+    }
+
+    function deltaEl(delta, goodDir) {
+      if (delta === null || delta === undefined) {
+        return el("div", "pct", META.statusHistory && META.statusHistory.length < 2 ? "first run" : GL.mdash);
+      }
+      if (delta === 0) return el("div", "pct", "same as last week");
+      var sign   = delta > 0 ? "+" : "";
+      var isGood = goodDir === 0 ? false : (delta > 0 ? goodDir > 0 : goodDir < 0);
+      var isBad  = goodDir !== 0 && !isGood;
+      return el("div", "pct" + (isGood ? " delta-good" : isBad ? " delta-bad" : ""),
+                sign + delta + " from last week");
+    }
+
+    // goodDir: +1 = more is good, -1 = fewer is good, 0 = neutral
     var defs = [
-      { key: "toDo",       label: "To Do",       color: "var(--ts-todo)",    goodDir: -1 },
-      { key: "inProgress", label: "In Progress",  color: "var(--ts-doing)",   goodDir:  0 },
-      { key: "done",       label: "Done",          color: "var(--ts-done)",    goodDir:  1 },
-      { key: "bugs",       label: "Bugs",          color: "var(--st-serious)", goodDir: -1 }
+      { key: "toDo",  label: "To Do",       color: "#3b82f6", goodDir: -1, val: toDo,    tot: totToDo  },
+      { key: "inProgress", label: "In Progress", color: "#f59e0b", goodDir: 0,  val: inPrg,   tot: totInPrg },
+      { key: "done",  label: "Done",         color: "#22c55e", goodDir:  1, val: done,    tot: totDone  },
+      { key: "bugs",  label: "New Bugs",     color: "#ef4444", goodDir: -1, val: newBugs, tot: totalBugs, noDelta: true }
     ];
 
     defs.forEach(function (def) {
-      var val   = c[def.key];
-      var delta = d[def.key];
-      var tile  = el("div", "tile");
+      var tile = el("div", "tile");
       tile.style.setProperty("--tile-color", def.color);
-      tile.appendChild(el("div", "value", fmt(val)));
+      tile.appendChild(el("div", "value", fmt(def.val)));
       tile.appendChild(el("div", "label", def.label));
-
-      var sub;
-      if (delta === null || delta === undefined) {
-        sub = el("div", "pct", "first run");
-      } else if (delta === 0) {
-        sub = el("div", "pct", "same as last week");
+      if (def.noDelta) {
+        tile.appendChild(el("div", "pct", "new this week  " + GL.dot + "  " + fmt(def.tot) + " total"));
       } else {
-        var sign   = delta > 0 ? "+" : "";
-        var isGood = def.goodDir === 0 ? false
-                   : (delta > 0 ? def.goodDir > 0 : def.goodDir < 0);
-        var isBad  = def.goodDir !== 0 && !isGood;
-        var cls    = "pct" + (isGood ? " delta-good" : isBad ? " delta-bad" : "");
-        sub = el("div", cls, sign + delta + " from last week");
+        var dEl = deltaEl(d[def.key], def.goodDir);
+        // Append total to the same line if there is no delta text yet
+        if (d[def.key] === null || d[def.key] === undefined) {
+          dEl.textContent += "  " + fmt(def.tot) + " total";
+        }
+        tile.appendChild(dEl);
       }
-      tile.appendChild(sub);
       wrap.appendChild(tile);
     });
   }
@@ -2212,6 +2411,22 @@ try {
   function renderLoadTable(groups) {
     var host = $("loadTable");
     host.textContent = "";
+    // Auto-select first PBI the first time the table is shown (or re-shown).
+    if (state.selectedPbiKey === null && !state._tableAutoSelected && groups.length > 0) {
+      for (var _gi = 0; _gi < groups.length; _gi++) {
+        var _gpbis = Object.keys(groups[_gi].pbis)
+          .map(function (k) { return groups[_gi].pbis[k]; })
+          .sort(function (a, b) {
+            var _p = (a.product || "").localeCompare(b.product || "");
+            return _p !== 0 ? _p : (a.title || "").localeCompare(b.title || "");
+          });
+        if (_gpbis.length > 0) {
+          state.selectedPbiKey = _gpbis[0].id || "(no PBI parent)";
+          state._tableAutoSelected = true;
+          break;
+        }
+      }
+    }
     var t = el("table"), thead = el("thead"), hr = el("tr");
 
     var hasAnyCap = groups.some(function (g) { return g.capRate > 0; });
@@ -2468,8 +2683,10 @@ try {
 
     var foot = el("div", "colfoot");
     var note = el("span", "sub");
-    var clear = el("button", null, "Clear column filters");
+    var clear = el("button", "icon-btn");
     clear.type = "button";
+    clear.title = "Clear column filters";
+    clear.innerHTML = '<svg viewBox="0 0 24 24" style="width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
     clear.addEventListener("click", function () {
       state.colFilters = {};
       var fields = fr.querySelectorAll("input, select");
@@ -2661,6 +2878,8 @@ try {
     var rows = visible();
     var sum = totals(rows);
 
+    renderStatusChart();
+    renderStatusDash();
     renderActivity();
     renderKpis(rows, sum);
     var groups = renderBars(rows);
@@ -2684,9 +2903,15 @@ try {
     // grouping, so restating it here only made the heading jitter on change.
     $("chartTitle").textContent = "Test Points";
 
-    var b = $("mistakeBanner");
-    if (sum.mistakes > 0) { $("mistakeCount").textContent = fmt(sum.mistakes); b.classList.remove("hidden"); }
-    else b.classList.add("hidden");
+    var exceptBtn = $("exceptBtn"), exceptBadge = $("exceptBadge");
+    if (sum.mistakes > 0) {
+      $("mistakeCount").textContent = fmt(sum.mistakes);
+      exceptBadge.textContent = sum.mistakes > 99 ? "99+" : sum.mistakes;
+      exceptBtn.hidden = false;
+    } else {
+      exceptBtn.hidden = true;
+      $("exceptPopover").classList.remove("open");
+    }
 
     // Two short stacked lines, not one long one: a single line was wide enough
     // to push this readout onto a row of its own.
@@ -2711,6 +2936,23 @@ try {
   wirePanel("fPerson",  "person",  "All people");
   wirePanel("fProduct", "product", "All products");
   wirePanel("fKind",    "kind",    "All kinds");
+
+  // Auto-switch Assigned Work Items to table view when a person is selected,
+  // back to chart view when selection is cleared.
+  $("fPerson").querySelector(".multi-panel").addEventListener("change", function () {
+    var hasPerson = state.person.size > 0;
+    if (state.loadTableView !== hasPerson) {
+      state.loadTableView = hasPerson;
+      if (!state.loadTableView) {
+        state.selectedPbiKey = null;
+        state._tableAutoSelected = false;
+      } else {
+        state._tableAutoSelected = false;
+      }
+      $("loadTableBtn").setAttribute("aria-pressed", hasPerson ? "true" : "false");
+      render();
+    }
+  });
 
   // fState: static panel (To Do / In Progress / Done).
   var fStatePanel = $("fState").querySelector(".multi-panel");
@@ -2770,8 +3012,6 @@ try {
 
   renderLegend();
   renderLoadLegend();
-  renderStatusChart();
-  renderStatusDash();
 
   $("fGroup").addEventListener("change",   function (e) { state.group = e.target.value; render(); });
   $("fText").addEventListener("input",     function (e) { state.text = e.target.value; render(); });
@@ -2786,29 +3026,56 @@ try {
     $("actRange").hidden = true;
     $("rangeStart").value = ""; $("rangeEnd").value = "";
     state.person = new Set(); state.product = new Set();
-    state.state = new Set(["To Do", "In Progress", "Done"]);
+    state.state = new Set(["In Progress", "Done"]);
     state.kind = new Set(); state.activity = new Set(["w7"]);
     state.activityRange = { start: "", end: "" }; state.text = "";
     $("fText").value = ""; $("fGroup").value = "assignee"; state.group = "assignee";
     $("fPerson").querySelector(".multi-label").textContent   = "All people";
     $("fProduct").querySelector(".multi-label").textContent  = "All products";
-    $("fState").querySelector(".multi-label").textContent    = "3 selected";
+    $("fState").querySelector(".multi-label").textContent    = "2 selected";
     $("fKind").querySelector(".multi-label").textContent     = "All kinds";
     $("fActivity").querySelector(".multi-label").textContent = "Last 7d";
     render();
   });
+  function collapseIcon(expanded) {
+    return expanded
+      ? '<svg viewBox="0 0 24 24" style="width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round"><polyline points="18 15 12 9 6 15"/></svg>'
+      : '<svg viewBox="0 0 24 24" style="width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round"><polyline points="6 9 12 15 18 9"/></svg>';
+  }
   function wireCollapse(btnId, bodyId) {
     var btn = $(btnId), body = $(bodyId);
     btn.addEventListener("click", function (e) {
       e.stopPropagation();
       var open = body.hidden;
       body.hidden = !open;
-      btn.textContent = open ? "Hide" : "Show";
       btn.setAttribute("aria-expanded", open ? "true" : "false");
+      btn.innerHTML = collapseIcon(open);
     });
   }
   wireCollapse("kpisToggle", "kpisBody");
   wireCollapse("chartToggle", "chartBody");
+
+  // Activity drawer
+  function openDrawer()  { $("activityDrawer").classList.add("open");    $("drawerOverlay").classList.add("open"); }
+  function closeDrawer() { $("activityDrawer").classList.remove("open"); $("drawerOverlay").classList.remove("open"); }
+  $("activityBtn").addEventListener("click", function () {
+    $("activityDrawer").classList.contains("open") ? closeDrawer() : openDrawer();
+  });
+  $("drawerClose").addEventListener("click", closeDrawer);
+  $("drawerOverlay").addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { closeDrawer(); $("exceptPopover").classList.remove("open"); } });
+
+  // Exceptions popover — position it below the button on click
+  $("exceptBtn").addEventListener("click", function (e) {
+    var pop = $("exceptPopover");
+    if (pop.classList.contains("open")) { pop.classList.remove("open"); return; }
+    var r = e.currentTarget.getBoundingClientRect();
+    pop.style.top  = (r.bottom + 6) + "px";
+    pop.style.right = (window.innerWidth - r.right) + "px";
+    pop.classList.add("open");
+    e.stopPropagation();
+  });
+  document.addEventListener("click", function () { $("exceptPopover").classList.remove("open"); });
 
   $("tableBtn").addEventListener("click", function () { state.tableView = !state.tableView; render(); });
   $("fLoadGroup").addEventListener("change", function (e) { state.loadGroup = e.target.value; render(); });
@@ -2819,7 +3086,12 @@ try {
   });
   $("loadTableBtn").addEventListener("click", function () {
     state.loadTableView = !state.loadTableView;
-    if (!state.loadTableView) state.selectedPbiKey = null;
+    if (!state.loadTableView) {
+      state.selectedPbiKey = null;
+      state._tableAutoSelected = false;
+    } else {
+      state._tableAutoSelected = false;
+    }
     render();
   });
 
@@ -2922,8 +3194,7 @@ try {
     Write-Host ("Bug counts snapshot written ({0} tasks)" -f $newCounts.Count)
 
     # Persist rolling status history for the trend chart and delta tiles.
-    $updatedHistory | ConvertTo-Json -Compress | Set-Content -LiteralPath $statusHistPath -Encoding UTF8
-    Write-Host ("Status history written ({0} week(s))" -f $updatedHistory.Count)
+    $updatedHistory | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath $statusHistPath -Encoding UTF8
 
     if ($Show) { Start-Process $OutputPath }
 }
