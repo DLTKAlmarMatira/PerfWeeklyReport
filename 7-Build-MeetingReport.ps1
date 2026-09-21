@@ -105,7 +105,7 @@ function Get-ProductFromIteration {
 # embedded in the page. If the browser computed "days ago" against its own
 # clock, a report opened next Tuesday would silently relabel last week's work
 # as current. A generated report should be a fixed snapshot.
-$AsOf = [datetime]::UtcNow
+$AsOf = [datetime]::UtcNow.AddHours(8)   # Philippine Time (UTC+8)
 
 # Parse an ISO date/datetime string as UTC regardless of the machine's local
 # timezone. TryParse without RoundtripKind treats the Z suffix as local time
@@ -286,8 +286,7 @@ try {
             }
         }
     }
-    # Derive previous counts from the last history entry (for delta tiles).
-    $statusPrev = if ($statusHistory.Count -gt 0) { $statusHistory[$statusHistory.Count - 1] } else { $null }
+    # $statusPrev is set after $weekTuesdayStr is known (see below).
 
     # --- Only Target Type = 'Bug' counts - a "Related" link also points at
     # --- other PBIs and Tasks, so counting all of them would be wrong.
@@ -724,6 +723,10 @@ try {
     $weeklyToDo  = @($tasks | Where-Object { $_.state -eq 'To Do'       -and $_.changedDays -ge 0 -and $_.changedDays -le 7 }).Count
     $weeklyInPrg = @($tasks | Where-Object { $_.state -eq 'In Progress' -and $_.changedDays -ge 0 -and $_.changedDays -le 7 }).Count
     $weeklyDone  = @($tasks | Where-Object { $_.closedDays -ge 0 -and $_.closedDays -le 7 }).Count
+    # Snapshot counts: total tasks in each state regardless of activity window.
+    $snapToDo  = @($tasks | Where-Object { $_.state -eq 'To Do' }).Count
+    $snapInPrg = @($tasks | Where-Object { $_.state -eq 'In Progress' }).Count
+    $snapDone  = @($tasks | Where-Object { $_.state -eq 'Done' }).Count
     $allBugIdSet = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($t in $tasks) {
         if ($t.bugIds) { foreach ($b in ($t.bugIds -split ',')) { [void]$allBugIdSet.Add($b) } }
@@ -750,6 +753,9 @@ try {
     $weekTuesdayStr    = $weekTuesdayDate.ToString('yyyy-MM-dd')
     # Days elapsed since the previous Tuesday (for retroactive window math).
     $daysSincePrevTue  = if ($daysToNextTuesday -eq 0) { 7 } else { 7 - $daysToNextTuesday }
+    # Previous week's entry — skip the current week's own entry so re-runs don't
+    # compare this week's count against itself and produce a bogus delta of 0.
+    $statusPrev = $statusHistory | Where-Object { $_.date -ne $weekTuesdayStr } | Select-Object -Last 1
 
     # Retroactive seeding: when no history exists, approximate prior-week counts
     # from changedDays/closedDays windows anchored to Tuesday boundaries.
@@ -764,7 +770,7 @@ try {
             $sToDo  = @($tasks | Where-Object { $_.state -eq 'To Do'       -and $_.changedDays -ge $winStart -and $_.changedDays -le $winEnd }).Count
             $sInPrg = @($tasks | Where-Object { $_.state -eq 'In Progress' -and $_.changedDays -ge $winStart -and $_.changedDays -le $winEnd }).Count
             $sDone  = @($tasks | Where-Object { $_.closedDays -ge $winStart -and $_.closedDays -le $winEnd }).Count
-            $statusHistory.Add([pscustomobject]@{ date=$seedDate; toDo=$sToDo; inProgress=$sInPrg; done=$sDone; bugs=0; totalBugs=$cntBugs })
+            $statusHistory.Add([pscustomobject]@{ date=$seedDate; toDo=$sToDo; inProgress=$sInPrg; done=$sDone; bugs=0; totalBugs=$cntBugs; snapToDo=$snapToDo; snapInProgress=$snapInPrg; snapDone=0 })
             Write-Host ("Retroactive seed: {0}  ToDo={1}  InPrg={2}  Done={3}" -f $seedDate, $sToDo, $sInPrg, $sDone)
         }
     }
@@ -778,13 +784,16 @@ try {
     foreach ($t in $tasks) {
         $name = $t.assignee
         if (-not $byPerson.ContainsKey($name)) {
-            $byPerson[$name] = [pscustomobject]@{ toDo=0; inProgress=0; done=0; totalBugs=0 }
+            $byPerson[$name] = [pscustomobject]@{ toDo=0; inProgress=0; done=0; totalBugs=0; snapToDo=0; snapInProgress=0; snapDone=0 }
             $byPersonBugSets[$name] = [System.Collections.Generic.HashSet[string]]::new()
         }
         if ($t.state -eq 'To Do'       -and $t.changedDays -ge 0 -and $t.changedDays -le 7) { $byPerson[$name].toDo++ }
         if ($t.state -eq 'In Progress' -and $t.changedDays -ge 0 -and $t.changedDays -le 7) { $byPerson[$name].inProgress++ }
         if ($t.closedDays -ge 0 -and $t.closedDays -le 7)                                   { $byPerson[$name].done++ }
         if ($t.bugIds) { foreach ($b in ($t.bugIds -split ',')) { [void]$byPersonBugSets[$name].Add($b) } }
+        if ($t.state -eq 'To Do')        { $byPerson[$name].snapToDo++ }
+        if ($t.state -eq 'In Progress')  { $byPerson[$name].snapInProgress++ }
+        if ($t.state -eq 'Done')         { $byPerson[$name].snapDone++ }
     }
     foreach ($pName in @($byPerson.Keys)) { $byPerson[$pName].totalBugs = $byPersonBugSets[$pName].Count }
 
@@ -795,7 +804,7 @@ try {
         if ($e.date -eq $weekTuesdayStr) { continue }
         $updatedHistory.Add($e)
     }
-    $updatedHistory.Add([pscustomobject]@{ date=$weekTuesdayStr; toDo=$weeklyToDo; inProgress=$weeklyInPrg; done=$weeklyDone; bugs=$weeklyBugs; totalBugs=$cntBugs; byPerson=$byPerson })
+    $updatedHistory.Add([pscustomobject]@{ date=$weekTuesdayStr; toDo=$weeklyToDo; inProgress=$weeklyInPrg; done=$weeklyDone; bugs=$weeklyBugs; totalBugs=$cntBugs; snapToDo=$snapToDo; snapInProgress=$snapInPrg; snapDone=$snapDone; byPerson=$byPerson })
     while ($updatedHistory.Count -gt 12) { $updatedHistory.RemoveAt(0) }
 
     Write-Host ("Status history: keyed to Tuesday {0} ({1} week(s) total)" -f $weekTuesdayStr, $updatedHistory.Count)
@@ -819,7 +828,7 @@ try {
 
     $payload = [pscustomobject][ordered]@{
         meta = [pscustomobject][ordered]@{
-            generated  = $AsOf.ToString('yyyy-MM-dd HH:mm')
+            generated  = $AsOf.ToString('yyyy-MM-dd hh:mm tt') + ' PHT'
             asOf       = $AsOf.ToString('yyyy-MM-dd')
             sourceRows = $connected.Count
             taskCount  = $tasks.Count
@@ -1250,6 +1259,9 @@ try {
   .icon-btn:hover { background: var(--surface-2); border-color: var(--rule); }
   .icon-btn svg { width: 18px; height: 18px; stroke: currentColor; fill: none;
     stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; display: block; }
+  .chart-mode-btn { width:32px; height:32px; display:flex; align-items:center; justify-content:center; border:1px solid var(--rule); border-radius:4px; background:var(--surface); color:var(--ink-2); cursor:pointer; opacity:0.55; transition:opacity .15s; }
+  .chart-mode-btn:hover { opacity:0.85; }
+  .chart-mode-btn.chart-mode-active { background:var(--accent,#6366f1); color:#fff; border-color:transparent; opacity:1; }
   .icon-badge {
     position: absolute; top: -3px; right: -3px;
     background: #ef4444; color: #fff; font-size: 9px; font-weight: 700;
@@ -1345,9 +1357,7 @@ try {
       <button class="multi-btn" type="button" aria-haspopup="true" aria-expanded="false"><span class="multi-label">Worked on, last 7 days</span></button>
       <div class="multi-panel" hidden>
         <label class="cb-item"><input type="checkbox" value="w7" checked><span>Worked on, last 7 days</span></label>
-        <label class="cb-item"><input type="checkbox" value="w14"><span>Worked on, last 14 days</span></label>
         <label class="cb-item"><input type="checkbox" value="c7"><span>Completed, last 7 days</span></label>
-        <label class="cb-item"><input type="checkbox" value="c30"><span>Completed, last 30 days</span></label>
         <div class="cb-sep"></div>
         <label class="cb-item"><input type="checkbox" value="range" id="cbRange"><span>Custom range</span></label>
         <div class="range-inputs" id="actRange" hidden>
@@ -1387,13 +1397,25 @@ try {
 </div>
 
 <div class="card" style="margin-bottom:16px">
-  <div style="display:flex;gap:20px;align-items:baseline;margin-bottom:10px">
-    <h2 style="margin:0;flex:1;min-width:0">Weekly Status</h2>
-    <span id="statusScope" style="width:280px;flex-shrink:0;text-align:center;font-size:14px;font-weight:600;color:var(--ink-2)"></span>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+    <h2 style="margin:0">Weekly Status</h2>
+    <div style="display:flex;gap:4px;align-items:center">
+      <button id="chartModeActivity" class="chart-mode-btn chart-mode-active" type="button" title="Activity view">
+        <svg viewBox="0 0 20 14" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="0,7 4,7 6,2 9,12 12,4 14,7 20,7"/></svg>
+      </button>
+      <button id="chartModeSnapshot" class="chart-mode-btn" type="button" title="Snapshot view">
+        <svg viewBox="0 0 16 14" width="20" height="20" fill="currentColor"><rect x="0" y="8" width="4" height="6" rx="0.5"/><rect x="6" y="3" width="4" height="11" rx="0.5"/><rect x="12" y="5" width="4" height="9" rx="0.5"/></svg>
+      </button>
+    </div>
   </div>
-  <div style="display:flex;gap:20px;align-items:center">
-    <div id="statusChart" style="flex:1;min-width:0"></div>
-    <div class="kpis" id="statusDash"></div>
+  <div style="display:flex;gap:20px;align-items:flex-start;margin-top:8px">
+    <div style="flex:1;min-width:0">
+      <div id="statusChart"></div>
+    </div>
+    <div style="display:flex;flex-direction:column;align-items:center;gap:8px">
+      <span id="statusScope" style="font-size:14px;font-weight:600;color:var(--ink-2);text-align:center"></span>
+      <div class="kpis" id="statusDash"></div>
+    </div>
   </div>
 </div>
 
@@ -1603,7 +1625,7 @@ try {
   }
 
   var state = { person: new Set(), product: new Set(),
-                state: new Set(["To Do", "In Progress", "Done"]),
+                state: new Set(["In Progress", "Done"]), chartMode: "activity",
                 kind: new Set(), text: "", activity: new Set(["w7"]),
                 activityRange: { start: "", end: "" },
                 group: "assignee", tableView: false, sortKey: "exec", sortDir: -1,
@@ -1648,7 +1670,7 @@ try {
     }
   };
   // Short display labels for the Activity button summary.
-  var ACT_LABEL = { w7: "Last 7d", w14: "Last 14d", c7: "Closed 7d", c30: "Closed 30d", range: "Custom" };
+  var ACT_LABEL = { w7: "Last 7d", c7: "Closed 7d", range: "Custom" };
   function activityLabel() {
     if (!state.activity.size) return "Any time";
     var arr = []; state.activity.forEach(function (a) { arr.push(ACT_LABEL[a] || a); });
@@ -1799,15 +1821,16 @@ try {
     var history = rawHistory.map(function (r) {
       if (!selPerson) return r;
       var p = r.byPerson && r.byPerson[selPerson];
-      return p ? { date: r.date, toDo: p.toDo || 0, inProgress: p.inProgress || 0, done: p.done || 0, bugs: p.totalBugs || 0 }
-               : { date: r.date, toDo: 0, inProgress: 0, done: 0, bugs: 0 };
+      return p ? { date: r.date, toDo: p.toDo || 0, inProgress: p.inProgress || 0, done: p.done || 0, bugs: p.totalBugs || 0, snapToDo: p.snapToDo || 0, snapInProgress: p.snapInProgress || 0, snapDone: p.snapDone || 0 }
+               : { date: r.date, toDo: 0, inProgress: 0, done: 0, bugs: 0, snapToDo: 0, snapInProgress: 0, snapDone: 0 };
     });
 
+    var snap = state.chartMode === "snapshot";
     var LINES = [
-      { key: "done",       label: "Done",        color: "#22c55e", dash: ""    },
-      { key: "inProgress", label: "In Progress",  color: "#f59e0b", dash: "5,3" },
-      { key: "toDo",       label: "To Do",        color: "#3b82f6", dash: "4,2" },
-      { key: "bugs",       label: "Bugs",          color: "#ef4444", dash: "2,2" }
+      { key: snap ? "snapDone"       : "done",        label: "Done",        color: "#22c55e", dash: ""    },
+      { key: snap ? "snapInProgress" : "inProgress",  label: "In Progress", color: "#f59e0b", dash: "8,8" },
+      { key: snap ? "snapToDo"       : "toDo",        label: "To Do",       color: "#3b82f6", dash: "6,8" },
+      { key: "bugs",                                   label: "Bugs",        color: "#ef4444", dash: "3,8" }
     ];
 
     var W = Math.max(200, wrap.offsetWidth || 560);
@@ -1879,6 +1902,19 @@ try {
       svg.appendChild(lbl);
     });
 
+    // Horizontal leader lines: from y-axis to each data point, per series.
+    LINES.forEach(function (def) {
+      history.forEach(function (r, i) {
+        var v = r[def.key] || 0;
+        if (v === 0) return;
+        var y = yPos(v);
+        svg.appendChild(svgEl("line", {
+          x1: PAD.left, x2: xPos(i), y1: y, y2: y,
+          stroke: def.color, "stroke-width": 0.75, opacity: 0.2
+        }));
+      });
+    });
+
     // Lines and dots (polyline omitted when only 1 point - dots still render)
     LINES.forEach(function (def) {
       if (history.length > 1) {
@@ -1940,15 +1976,36 @@ try {
       newBugs = prevP ? Math.max(0, totalBugs - (prevP.totalBugs || prevP.bugs || 0)) : 0;
     }
 
-    // Week-over-week deltas for the weekly counts.
+    var snap = state.chartMode === "snapshot";
+
+    // In snapshot mode the card values are totals, not weekly-activity counts.
+    var cardToDo = snap ? totToDo : toDo;
+    var cardInPrg = snap ? totInPrg : inPrg;
+    var cardDone  = snap ? totDone  : done;
+
+    // Week-over-week deltas — use snapshot fields when in snapshot mode.
     var d = {};
     if (noFilter) {
-      d = META.statusDeltas || {};
+      if (snap && META.statusHistory && META.statusHistory.length >= 2) {
+        var prevSnap = META.statusHistory[META.statusHistory.length - 2];
+        d = {
+          toDo:       totToDo  - (prevSnap.snapToDo       || prevSnap.toDo       || 0),
+          inProgress: totInPrg - (prevSnap.snapInProgress || prevSnap.inProgress || 0),
+          done:       totDone  - ((prevSnap.snapToDo !== undefined ? (META.statusHistory.reduce(function(s,e){ return s + (e.done||0); }, 0) - (META.statusHistory[META.statusHistory.length-2] ? META.statusHistory.slice(0,-1).reduce(function(s,e){ return s+(e.done||0);},0) : 0)) : null))
+        };
+        d.done = null; // cumulative Done delta is noise — hide it in snapshot mode
+      } else {
+        d = META.statusDeltas || {};
+      }
     } else if (selPerson && META.statusHistory && META.statusHistory.length >= 2) {
       var ph = META.statusHistory[META.statusHistory.length - 2];
       var pp = ph.byPerson && ph.byPerson[selPerson];
       if (pp) {
-        d = {
+        d = snap ? {
+          toDo:       totToDo  - (pp.snapToDo       || pp.toDo       || 0),
+          inProgress: totInPrg - (pp.snapInProgress || pp.inProgress || 0),
+          done:       null
+        } : {
           toDo:       toDo - (pp.toDo       || 0),
           inProgress: inPrg - (pp.inProgress || 0),
           done:       done  - (pp.done       || 0)
@@ -1970,10 +2027,10 @@ try {
 
     // goodDir: +1 = more is good, -1 = fewer is good, 0 = neutral
     var defs = [
-      { key: "toDo",  label: "To Do",       color: "#3b82f6", goodDir: -1, val: toDo,    tot: totToDo  },
-      { key: "inProgress", label: "In Progress", color: "#f59e0b", goodDir: 0,  val: inPrg,   tot: totInPrg },
-      { key: "done",  label: "Done",         color: "#22c55e", goodDir:  1, val: done,    tot: totDone  },
-      { key: "bugs",  label: "New Bugs",     color: "#ef4444", goodDir: -1, val: newBugs, tot: totalBugs, noDelta: true }
+      { key: "toDo",       label: "To Do",       color: "#3b82f6", goodDir: -1, val: cardToDo,  tot: snap ? null : totToDo  },
+      { key: "inProgress", label: "In Progress",  color: "#f59e0b", goodDir:  0, val: cardInPrg, tot: snap ? null : totInPrg },
+      { key: "done",       label: "Done",         color: "#22c55e", goodDir:  1, val: cardDone,  tot: snap ? null : totDone  },
+      { key: "bugs",       label: "New Bugs",     color: "#ef4444", goodDir: -1, val: newBugs,   tot: totalBugs, noDelta: true }
     ];
 
     defs.forEach(function (def) {
@@ -2412,7 +2469,8 @@ try {
     var host = $("loadTable");
     host.textContent = "";
     // Auto-select first PBI the first time the table is shown (or re-shown).
-    if (state.selectedPbiKey === null && !state._tableAutoSelected && groups.length > 0) {
+    // Guard on loadTableView so the hidden initial render doesn't consume the flag.
+    if (state.loadTableView && state.selectedPbiKey === null && !state._tableAutoSelected && groups.length > 0) {
       for (var _gi = 0; _gi < groups.length; _gi++) {
         var _gpbis = Object.keys(groups[_gi].pbis)
           .map(function (k) { return groups[_gi].pbis[k]; })
@@ -2976,7 +3034,7 @@ try {
     // Show/hide date inputs when the Custom range checkbox is toggled.
     if (e.target.value === "range") { $("actRange").hidden = !e.target.checked; }
     state.activity = setFromPanel(fActPanel);
-    if (state.activity.has("c7") || state.activity.has("c30")) {
+    if (state.activity.has("c7")) {
       fStatePanel.querySelectorAll("input[type=checkbox]").forEach(function (cb) { cb.checked = false; });
       state.state = new Set();
       $("fState").querySelector(".multi-label").textContent = "All states";
@@ -3013,6 +3071,21 @@ try {
   renderLegend();
   renderLoadLegend();
 
+  $("chartModeActivity").addEventListener("click", function () {
+    state.chartMode = "activity";
+    $("chartModeActivity").classList.add("chart-mode-active");
+    $("chartModeSnapshot").classList.remove("chart-mode-active");
+    renderStatusChart();
+    renderStatusDash();
+  });
+  $("chartModeSnapshot").addEventListener("click", function () {
+    state.chartMode = "snapshot";
+    $("chartModeSnapshot").classList.add("chart-mode-active");
+    $("chartModeActivity").classList.remove("chart-mode-active");
+    renderStatusChart();
+    renderStatusDash();
+  });
+
   $("fGroup").addEventListener("change",   function (e) { state.group = e.target.value; render(); });
   $("fText").addEventListener("input",     function (e) { state.text = e.target.value; render(); });
   $("fReset").addEventListener("click", function () {
@@ -3020,7 +3093,7 @@ try {
       $(id).querySelectorAll("input[type=checkbox]").forEach(function (cb) { cb.checked = false; });
     });
     $("fState").querySelectorAll("input[type=checkbox]").forEach(function (cb) {
-      cb.checked = (cb.value === "To Do" || cb.value === "In Progress");
+      cb.checked = (cb.value === "In Progress" || cb.value === "Done");
     });
     $("fActivity").querySelectorAll("input[type=checkbox]").forEach(function (cb) { cb.checked = cb.value === "w7"; });
     $("actRange").hidden = true;
